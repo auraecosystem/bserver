@@ -113,8 +113,24 @@ case "$ACTION" in
 
         echo ""
         info "Verifying installation…"
-        check_php
-        info "PHP is ready. bserver will auto-detect php-cgi on next start."
+        check_php || true
+
+        # bserver resolves php-cgi ONCE, at startup. A running instance will
+        # keep failing .php requests with "exec: no command" until it is
+        # restarted to pick up the newly-installed php-cgi.
+        echo ""
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet bserver 2>/dev/null; then
+            info "IMPORTANT: bserver is already running and resolved php-cgi at startup."
+            info "           Restart it now so PHP takes effect:"
+            echo   "               sudo systemctl restart bserver"
+        elif command -v launchctl >/dev/null 2>&1 && launchctl list 2>/dev/null | grep -q "com.local.bserver"; then
+            info "IMPORTANT: bserver is already running and resolved php-cgi at startup."
+            info "           Restart it now so PHP takes effect:"
+            echo   "               sudo ./install-service.sh restart"
+        else
+            info "PHP is ready. Start bserver and it will detect php-cgi:"
+            echo   "               sudo ./install-service.sh"
+        fi
         ;;
     *)
         die "Unknown action: $ACTION (use install or check)"
