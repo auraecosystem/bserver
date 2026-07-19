@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,7 @@ type siteSettings struct {
 	ProxyBackend   string        // host:port backend that ProxyPath forwards to
 	ProxyKey       string        // required bs_proxy_auth cookie / Bearer value for ProxyPath (empty = open)
 	RawYAML        []string      // site-relative .yaml files served raw (text/yaml) instead of rendered as pages
+	AllowIPs       []*net.IPNet  // client IP allowlist (IPs/CIDRs); empty = allow all
 }
 
 // loadConfigMap loads a _config.yaml file and returns its contents as a map.
@@ -206,7 +208,76 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 			log.Printf("Warning: proxy-path-key-file %q unreadable: %v", v, err)
 		}
 	}
+	// Client IP allowlist. When set, only listed IPs/CIDRs may reach this vhost
+	// at all (pages, static files, and proxied paths). The list can be given
+	// inline via allow-ip and/or in a file (one IP/CIDR per line, # comments)
+	// via allow-ip-file — handy for a secret/managed list outside the webroot.
+	if v, ok := configIndex(m, "allow-ip"); ok {
+		s.AllowIPs = parseIPNets(v)
+	}
+	if v, ok := configString(m, "allow-ip-file", ""); ok && v != "" {
+		if b, err := os.ReadFile(v); err == nil {
+			var lines []string
+			for _, ln := range strings.Split(string(b), "\n") {
+				if ln = strings.TrimSpace(ln); ln != "" && !strings.HasPrefix(ln, "#") {
+					lines = append(lines, ln)
+				}
+			}
+			s.AllowIPs = append(s.AllowIPs, parseIPNets(lines)...)
+		} else {
+			log.Printf("Warning: allow-ip-file %q unreadable: %v", v, err)
+		}
+	}
 	return s
+}
+
+// parseIPNets converts a list of IP addresses and CIDRs into matchers. A bare
+// address becomes a single-host net (/32 for IPv4, /128 for IPv6). Invalid
+// entries are logged and skipped so one typo can't silently open the vhost.
+func parseIPNets(entries []string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, e := range entries {
+		if e = strings.TrimSpace(e); e == "" {
+			continue
+		}
+		if strings.Contains(e, "/") {
+			if _, n, err := net.ParseCIDR(e); err == nil {
+				out = append(out, n)
+			} else {
+				log.Printf("Warning: invalid allow-ip CIDR %q: %v", e, err)
+			}
+			continue
+		}
+		ip := net.ParseIP(e)
+		if ip == nil {
+			log.Printf("Warning: invalid allow-ip address %q", e)
+			continue
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return out
+}
+
+// ipAllowed reports whether ip falls within any allowlist entry. An empty list
+// allows everything (feature disabled). An unparseable ip is denied.
+func ipAllowed(ip string, nets []*net.IPNet) bool {
+	if len(nets) == 0 {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizePathPatterns trims whitespace from each pattern and drops empties.

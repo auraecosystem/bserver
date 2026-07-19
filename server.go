@@ -292,6 +292,15 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolve per-vhost settings (cached, mtime-invalidated)
 	site := vhostSettings(root, m.cfg.Site)
 
+	// Per-vhost IP allowlist: if configured, only listed client IPs may reach
+	// this vhost at all — pages, static files, and proxied paths alike. Checked
+	// before proxy handling so a gated backend (e.g. a /terminal/ web shell) is
+	// covered too.
+	if len(site.AllowIPs) > 0 && !ipAllowed(clientIP(r), site.AllowIPs) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	// Check if this vhost is a proxy (index.yaml with http: backend)
 	if entry := getProxyForVhost(root, m); entry != nil {
 		if entry.proxy != nil {
