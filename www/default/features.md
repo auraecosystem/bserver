@@ -40,6 +40,55 @@ level deeper than the known `example.com` vhost).
 If the `default` directory doesn't exist, requests that would fall back to
 it receive a `404 Not Found`.
 
+## Path-Embedded GET Arguments
+
+Any page script can receive GET arguments as path segments instead of a
+query string. These two URLs are equivalent:
+
+```
+https://example.com/confirm?token=abc123
+https://example.com/confirm/token/abc123
+```
+
+This works automatically for every `.yaml`, `.md`, and `.php` page — no
+configuration required. It exists because email security scanners and link
+rewriters sometimes mangle or refuse to forward `?name=value` query
+strings; the path form survives them intact.
+
+### How It Works
+
+When a URL doesn't resolve to any file or directory, bserver looks for the
+longest leading portion of the path that resolves to a page script —
+exactly as if that portion had been requested directly (`confirm` finds
+`confirm.yaml`, `confirm.md`, or `confirm.php`, a directory index, or the
+`dir/dir.yaml` naming convention). The remaining segments are taken
+pairwise as `name/value` arguments and passed to the script just as
+`?name=value` would be:
+
+```
+/report/year/2026/month/7      →  /report?year=2026&month=7
+/subdir/confirm/token/abc123   →  /subdir/confirm?token=abc123
+/search/q                      →  /search?q        (odd trailing segment)
+```
+
+A real query string can be combined with path arguments; the path pairs
+are appended after it. The arguments are passed blindly — if the script
+ignores them (or there is no script in the YAML at all), the page still
+renders normally; extra arguments are never an error.
+
+### Notes
+
+- Only page-generating scripts (`.yaml`, `.md`, `.php`) are matched.
+  Static files like `.html` or images never receive path arguments, so
+  argument URLs can't alias static content.
+- The script portion of the URL is still subject to the blocked-paths
+  rules below; argument *values* that merely look like blocked names
+  (e.g. a token starting with `_`) are fine.
+- Values are URL-decoded path segments, so a value cannot contain a
+  literal `/`. Use a regular query string for values that need one.
+- Requests with arguments are treated as dynamic and bypass the render
+  cache, same as any request with a query string.
+
 ## Render Cache
 
 bserver caches rendered YAML and markdown pages in memory. When the same page
