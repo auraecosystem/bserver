@@ -292,6 +292,40 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolve per-vhost settings (cached, mtime-invalidated)
 	site := vhostSettings(root, m.cfg.Site)
 
+	// Per-vhost IP allowlist: if configured, only listed client IPs may reach
+	// this vhost at all — pages, static files, and proxied paths alike. Checked
+	// before proxy handling so a gated backend (e.g. a /terminal/ web shell) is
+	// covered too.
+	if len(site.AllowIPs) > 0 && !ipAllowed(clientIP(r), site.AllowIPs) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Per-vhost passwordless auth: when auth-email is configured, everything
+	// outside the always-public set (splash, /auth/*, assets) requires a valid
+	// bs_auth cookie, obtained via a one-time code mailed to that address.
+	// Checked before proxy handling so a gated backend (e.g. the /terminal/ web
+	// shell) is covered too. See auth.go.
+	if site.AuthEmail != "" {
+		p := path.Clean("/" + r.URL.Path)
+		if strings.HasPrefix(p, "/auth/") {
+			serveAuth(w, r, site, p)
+			return
+		}
+		if !authPublic(p, site) && !validAuthCookie(r, site) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				next := r.URL.Path
+				if r.URL.RawQuery != "" {
+					next += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, "/auth/login?next="+urlQueryEscape(next), http.StatusSeeOther)
+			} else {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			}
+			return
+		}
+	}
+
 	// Check if this vhost is a proxy (index.yaml with http: backend)
 	if entry := getProxyForVhost(root, m); entry != nil {
 		if entry.proxy != nil {

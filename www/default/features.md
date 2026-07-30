@@ -254,6 +254,44 @@ block-paths:
   - /internal/secrets   # ...this exact rooted path
 ```
 
+## Vhost Authentication
+
+A virtual host can be placed behind a passwordless login by setting `auth-email`
+in its `_config.yaml`. When set, the host stays reachable from any IP, but every
+path outside the always-public set (the splash page `/`, `/favicon.ico`,
+`/robots.txt`, anything under `/.well-known/`, the `/auth/*` login endpoints,
+and any prefixes you add via `auth-public`) requires a valid session cookie.
+
+A visitor signs in by requesting a one-time 6-digit code, which is emailed to
+`auth-email`, and entering it. On success bserver sets `bs_auth` — an
+HMAC-signed cookie carrying the address and an expiry — so the session is
+verified statelessly on every request and survives restarts. The cookie lasts
+`auth-ttl-days` (default 7) before a fresh code is needed. `/auth/logout` clears
+it. Codes expire after 10 minutes, are single-use, are burned after 5 wrong
+guesses, and are rate-limited (no more than one per 30 s or five per hour).
+
+| Setting | Description |
+|---------|-------------|
+| `auth-email` | Recipient of login codes. **Presence enables the gate.** |
+| `auth-smtp` | SMTP relay `host:port` for sending codes (default `b.stg.net:25`). Plain SMTP to a trusted relay — no auth/STARTTLS is attempted. |
+| `auth-from` | `From`/envelope sender for the code email (default = `auth-email`). |
+| `auth-secret-file` | Path (keep it **outside** the webroot) to the cookie-signing key. Auto-created `0600` with 32 random bytes if missing, and persisted so 7-day cookies survive restarts. **Required** — the gate stays off if it is missing or unusable. |
+| `auth-public` | Extra always-public path prefixes, beyond the built-in set. |
+| `auth-ttl-days` | Session cookie lifetime in days (default `7`). |
+
+```yaml
+# www/example.com/_config.yaml
+auth-email: owner@example.com
+auth-secret-file: /var/lib/bserver-secrets/example-auth   # not under the webroot
+auth-ttl-days: 7
+```
+
+The gate runs before proxy handling and before the render cache is consulted, so
+a path-based reverse proxy (e.g. a `/terminal/` web shell) is covered too, and a
+cached page is never served to an unauthenticated client. The `bs_auth` cookie
+is `HttpOnly`, `Secure`, and `SameSite=Lax`, so the vhost must be served over
+HTTPS (the default) for logins to stick.
+
 ## Security Headers
 
 Every response includes these security headers automatically:
