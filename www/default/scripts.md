@@ -216,6 +216,11 @@ similarly to scripts running under Apache or nginx:
 All HTTP request headers are also available as `HTTP_*` variables (e.g.,
 `HTTP_USER_AGENT`, `HTTP_ACCEPT`).
 
+`QUERY_STRING` (and therefore `$_GET` in PHP) also includes any arguments
+embedded as path segments — `/confirm/token/abc123` arrives the same as
+`/confirm?token=abc123`. See
+[Path-Embedded GET Arguments](features#path-embedded-get-arguments).
+
 ## Real-World Example: Active Navigation
 
 The built-in navbar uses Python scripting to highlight the current page:

@@ -114,6 +114,8 @@ proxy mode — composes from these four pieces.
 - **Render cache** with fsnotify invalidation and RAM-aware sizing
 - **Security headers, rate limiting, privilege dropping**, port-80
   fallback
+- **Path-embedded GET arguments** — `/script/name/value` works like
+  `/script?name=value`, surviving email scanners that strip query strings
 - **Auto-generated favicons** with optional `_favicon.yaml` customization
 - **Debug mode** — `?debug` emits HTML-comment traces of name resolution
 

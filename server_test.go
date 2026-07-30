@@ -529,3 +529,184 @@ func TestHostOnly(t *testing.T) {
 		}
 	}
 }
+
+// --- Path-embedded GET arguments (/script/name/value) ---
+
+func TestPathArgsQuery(t *testing.T) {
+	tests := []struct {
+		segs []string
+		want string
+	}{
+		{[]string{"a", "1"}, "a=1"},
+		{[]string{"a", "1", "b", "2"}, "a=1&b=2"},
+		{[]string{"a"}, "a"},
+		{[]string{"a", "1", "b"}, "a=1&b"},
+		{[]string{"a b", "c&d"}, "a+b=c%26d"},
+		{[]string{"email", "user@example.com"}, "email=user%40example.com"},
+	}
+	for _, tt := range tests {
+		if got := pathArgsQuery(tt.segs); got != tt.want {
+			t.Errorf("pathArgsQuery(%v) = %q, want %q", tt.segs, got, tt.want)
+		}
+	}
+}
+
+func TestResolvePathArgScript(t *testing.T) {
+	tmp := t.TempDir()
+	site := siteSettings{Index: []string{"index.yaml", "index.md", "index.php", "index.html"}}
+
+	os.WriteFile(filepath.Join(tmp, "page.yaml"), []byte("main: hi\n"), 0644)
+	os.WriteFile(filepath.Join(tmp, "script.php"), []byte("<?php ?>"), 0644)
+	os.WriteFile(filepath.Join(tmp, "static.html"), []byte("<p>hi</p>"), 0644)
+	os.MkdirAll(filepath.Join(tmp, "app"), 0755)
+	os.WriteFile(filepath.Join(tmp, "app", "index.php"), []byte("<?php ?>"), 0644)
+	os.MkdirAll(filepath.Join(tmp, "docs"), 0755)
+	os.WriteFile(filepath.Join(tmp, "docs", "index.html"), []byte("<p>hi</p>"), 0644)
+	os.MkdirAll(filepath.Join(tmp, "blog"), 0755)
+	os.WriteFile(filepath.Join(tmp, "blog", "blog.yaml"), []byte("main: hi\n"), 0644)
+
+	tests := []struct {
+		base string
+		want string
+	}{
+		{"page", filepath.Join(tmp, "page.yaml")},        // sibling .yaml
+		{"script", filepath.Join(tmp, "script.php")},     // sibling .php
+		{"script.php", filepath.Join(tmp, "script.php")}, // explicit script file
+		{"static.html", ""},                              // static file — not eligible
+		{"static", ""},                                   // no script sibling
+		{"app", filepath.Join(tmp, "app", "index.php")},  // directory index script
+		{"docs", ""}, // directory index is static
+		{"blog", filepath.Join(tmp, "blog", "blog.yaml")}, // dirname convention
+		{"missing", ""}, // nothing there
+	}
+	for _, tt := range tests {
+		if got := resolvePathArgScript(filepath.Join(tmp, tt.base), site); got != tt.want {
+			t.Errorf("resolvePathArgScript(%q) = %q, want %q", tt.base, got, tt.want)
+		}
+	}
+}
+
+func TestPathArgsServesMarkdownScript(t *testing.T) {
+	base, _ := os.Getwd()
+	mux := newTestMux(t, filepath.Join(base, "www"))
+
+	for _, path := range []string{
+		"/getting-started/x/123",
+		"/getting-started/x/123/y/456",
+		"/getting-started/x",                      // odd count — bare parameter
+		"/getting-started/email/user@example.com", // dot in value (disallowed "ext")
+		"/getting-started/token/_abc",             // arg value looks like a hidden file
+		"/subdir/getting-started/x/1",             // wrong subdir — must not match
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Host = "default"
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		resp := w.Result()
+
+		wantStatus := http.StatusOK
+		if strings.HasPrefix(path, "/subdir/") {
+			wantStatus = http.StatusNotFound
+		}
+		if resp.StatusCode != wantStatus {
+			t.Errorf("GET %s: status = %d, want %d", path, resp.StatusCode, wantStatus)
+			continue
+		}
+		if wantStatus == http.StatusOK && !strings.Contains(w.Body.String(), "Getting Started") {
+			t.Errorf("GET %s: response missing page content", path)
+		}
+	}
+}
+
+func TestPathArgsMergesQueryString(t *testing.T) {
+	base, _ := os.Getwd()
+	mux := newTestMux(t, filepath.Join(base, "www"))
+
+	req := httptest.NewRequest("GET", "/getting-started/x/123?y=456", nil)
+	req.Host = "default"
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Result().StatusCode, http.StatusOK)
+	}
+	if got := req.URL.RawQuery; got != "y=456&x=123" {
+		t.Errorf("merged RawQuery = %q, want %q", got, "y=456&x=123")
+	}
+}
+
+func TestPathArgsUnknownScript404(t *testing.T) {
+	base, _ := os.Getwd()
+	mux := newTestMux(t, filepath.Join(base, "www"))
+
+	req := httptest.NewRequest("GET", "/no-such-script/name/value", nil)
+	req.Host = "default"
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Result().StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestPathArgsBlockedScriptPrefixStaysBlocked(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.MkdirAll(filepath.Join(tmpDir, "default", "vendor"), 0755)
+	os.WriteFile(filepath.Join(tmpDir, "default", "vendor", "index.yaml"),
+		[]byte("main: secret\n"), 0644)
+	mux := newTestMux(t, tmpDir)
+
+	req := httptest.NewRequest("GET", "/vendor/name/value", nil)
+	req.Host = "default"
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Result().StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (blocked prefix must not serve via path args)",
+			w.Result().StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestExtensionlessPHPSibling(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.MkdirAll(filepath.Join(tmpDir, "default"), 0755)
+	os.WriteFile(filepath.Join(tmpDir, "default", "hello.php"),
+		[]byte("<?php echo 'ok'; ?>"), 0644)
+	mux := newTestMux(t, tmpDir)
+
+	req := httptest.NewRequest("GET", "/hello", nil)
+	req.Host = "default"
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// Without php-cgi configured the handler reports a CGI error; the point
+	// is that the request routed to the PHP handler instead of a 404.
+	if w.Result().StatusCode == http.StatusNotFound {
+		t.Error("extensionless URL did not route to sibling .php file")
+	}
+}
+
+func TestPathArgsReachScriptQueryString(t *testing.T) {
+	// End-to-end: path-embedded arguments must arrive in the script's
+	// QUERY_STRING exactly as a ?query would.
+	tmpDir := t.TempDir()
+	vhost := filepath.Join(tmpDir, "default")
+	os.MkdirAll(vhost, 0755)
+	os.WriteFile(filepath.Join(vhost, "html.yaml"), []byte("html:\n - body\n"), 0644)
+	os.WriteFile(filepath.Join(vhost, "body.yaml"), []byte("body:\n - main\n"), 0644)
+	os.WriteFile(filepath.Join(vhost, "echo.yaml"), []byte(
+		"main:\n  - js: |\n      print('QS[' + env.QUERY_STRING + ']');\n\n^js:\n  script: javascript\n"), 0644)
+	mux := newTestMux(t, tmpDir)
+
+	req := httptest.NewRequest("GET", "/echo/x/123/y/hello%20world", nil)
+	req.Host = "default"
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body:\n%s", w.Result().StatusCode, http.StatusOK, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "QS[x=123&y=hello+world]") {
+		t.Errorf("script did not receive path args in QUERY_STRING; body:\n%s", w.Body.String())
+	}
+}

@@ -397,6 +397,12 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// .well-known is exempt; operators can adjust via the allow-paths and
 	// block-paths keys in _config.yaml.
 	if site.pathBlocked(upath) {
+		// A blocked path may still be a path-args URL whose *argument*
+		// segments merely look like hidden files (e.g. /verify/token/_abc);
+		// tryPathArgs re-checks pathBlocked on the script prefix itself.
+		if m.tryPathArgs(w, r, host, root, upath, site) {
+			return
+		}
 		m.serveErrorPage(w, r, root, http.StatusNotFound, "", site, hostFallback)
 		return
 	}
@@ -447,6 +453,11 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Block file types not in the allowed types list
 	if ext := filepath.Ext(fsPath); ext != "" {
 		if !isAllowedType(ext, site.Types) {
+			// The "extension" may just be a dot inside a path-args value
+			// (e.g. /confirm/email/user@example.com).
+			if m.tryPathArgs(w, r, host, root, upath, site) {
+				return
+			}
 			m.serveErrorPage(w, r, root, http.StatusNotFound, "", site, hostFallback)
 			return
 		}
@@ -507,7 +518,7 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Directory exists but no index/name file was found above;
 			// this was already handled in the directory block, so fall through
 		} else {
-			// No directory — try sibling .yaml then .md
+			// No directory — try sibling .yaml, .md, then .php
 			yamlPath := fsPath + ".yaml"
 			if st, err := os.Stat(yamlPath); err == nil && !st.IsDir() {
 				m.handleYAML(w, r, root, yamlPath, site)
@@ -516,6 +527,11 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			mdPath := fsPath + ".md"
 			if st, err := os.Stat(mdPath); err == nil && !st.IsDir() {
 				m.handleMarkdown(w, r, root, mdPath, site)
+				return
+			}
+			phpPath := fsPath + ".php"
+			if st, err := os.Stat(phpPath); err == nil && !st.IsDir() {
+				m.handlePHP(w, r, host, root, phpPath, site)
 				return
 			}
 		}
@@ -545,7 +561,154 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Last resort: interpret the URL as /script/name/value... path args
+	if m.tryPathArgs(w, r, host, root, upath, site) {
+		return
+	}
+
 	m.serveErrorPage(w, r, root, http.StatusNotFound, "", site, hostFallback)
+}
+
+// pathArgScriptExts lists the script types, in sibling-lookup priority
+// order, that can receive path-embedded GET arguments. Static types are
+// deliberately excluded: an argument-bearing URL must resolve to something
+// that generates page output, and matching static files would silently
+// alias unlimited URLs onto one document.
+var pathArgScriptExts = []string{".yaml", ".md", ".php"}
+
+// isPathArgScript reports whether p is a page-generating script type that
+// is also permitted by the site's allowed-types list.
+func isPathArgScript(p string, site siteSettings) bool {
+	ext := strings.ToLower(filepath.Ext(p))
+	for _, e := range pathArgScriptExts {
+		if ext == e {
+			return isAllowedType(ext, site.Types)
+		}
+	}
+	return false
+}
+
+// resolvePathArgScript resolves a candidate path-args script prefix the
+// same way a direct request for it would resolve: an existing script file
+// (explicit /script.php/name/value), a directory's index or name file, or
+// an extensionless sibling script. Returns "" when the prefix resolves to
+// nothing — or to a non-script (static) file, which is not eligible to
+// receive arguments.
+func resolvePathArgScript(fsBase string, site siteSettings) string {
+	if st, err := os.Stat(fsBase); err == nil {
+		if !st.IsDir() {
+			if isPathArgScript(fsBase, site) {
+				return fsBase
+			}
+			return ""
+		}
+		// Directory: mirror the index-file resolution of a direct request.
+		// The first index that exists decides — if it is a static type, the
+		// direct request would serve static content, so no args here either.
+		for _, idx := range site.Index {
+			cand := filepath.Join(fsBase, idx)
+			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+				if isPathArgScript(cand, site) {
+					return cand
+				}
+				return ""
+			}
+		}
+		dirName := filepath.Base(fsBase)
+		for _, idx := range site.Index {
+			cand := filepath.Join(fsBase, dirName+filepath.Ext(idx))
+			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+				if isPathArgScript(cand, site) {
+					return cand
+				}
+				return ""
+			}
+		}
+		return ""
+	}
+	if filepath.Ext(fsBase) != "" {
+		return ""
+	}
+	// Extensionless sibling lookup, same order as the main handler.
+	for _, ext := range pathArgScriptExts {
+		cand := fsBase + ext
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() && isAllowedType(ext, site.Types) {
+			return cand
+		}
+	}
+	return ""
+}
+
+// pathArgsQuery encodes path segments taken pairwise as a query string:
+// [a 1 b 2] -> "a=1&b=2". An odd trailing segment becomes a bare
+// parameter with no value, matching how "?name" (no "=") arrives.
+func pathArgsQuery(segs []string) string {
+	var qb strings.Builder
+	for j := 0; j < len(segs); j += 2 {
+		if qb.Len() > 0 {
+			qb.WriteByte('&')
+		}
+		qb.WriteString(url.QueryEscape(segs[j]))
+		if j+1 < len(segs) {
+			qb.WriteByte('=')
+			qb.WriteString(url.QueryEscape(segs[j+1]))
+		}
+	}
+	return qb.String()
+}
+
+// tryPathArgs attempts to serve an otherwise-unresolved request whose URL
+// embeds GET arguments as trailing path segments:
+//
+//	/script/name/value[/name2/value2...]  ≡  /script?name=value&name2=value2
+//
+// Some email security scanners and link rewriters mangle or refuse to
+// forward ?name=value query strings; this URL form survives them. No
+// configuration is required: the longest leading prefix that resolves to a
+// page-generating script (.yaml, .md, or .php) wins, and the remaining
+// segments are folded into r.URL.RawQuery exactly as a ?query would
+// arrive, appended after any real query already present. The parameters
+// are passed blindly — a script that ignores them still renders normally.
+// Because the merged query is non-empty, the render cache already treats
+// these requests as dynamic and never caches them.
+//
+// Returns true if the request was handled (rendered or delegated),
+// false if no prefix resolves to a script and normal 404 handling
+// should proceed.
+func (m *virtualHostMux) tryPathArgs(w http.ResponseWriter, r *http.Request, host, root, upath string, site siteSettings) bool {
+	segs := splitPath(upath)
+	if len(segs) < 2 {
+		return false
+	}
+	for i := len(segs) - 1; i >= 1; i-- {
+		prefix := "/" + strings.Join(segs[:i], "/")
+		// The script itself must pass the path-block rules even when the
+		// full URL was let through (and vice versa: blocked arg values
+		// don't disqualify an allowed script).
+		if site.pathBlocked(prefix) {
+			continue
+		}
+		script := resolvePathArgScript(filepath.Join(root, filepath.FromSlash(prefix)), site)
+		if script == "" {
+			continue
+		}
+		q := pathArgsQuery(segs[i:])
+		if r.URL.RawQuery != "" {
+			r.URL.RawQuery += "&" + q
+		} else {
+			r.URL.RawQuery = q
+		}
+		switch strings.ToLower(filepath.Ext(script)) {
+		case ".php":
+			m.handlePHP(w, r, host, root, script, site)
+		case ".yaml":
+			m.handleYAML(w, r, root, script, site)
+		default: // ".md"
+			m.handleMarkdown(w, r, root, script, site)
+		}
+		return true
+	}
+	return false
 }
 
 func (m *virtualHostMux) handlePHP(w http.ResponseWriter, r *http.Request, host, docroot, scriptFilename string, site siteSettings) {
