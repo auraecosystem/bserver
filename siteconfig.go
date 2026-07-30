@@ -31,6 +31,12 @@ type siteSettings struct {
 	ProxyKey       string        // required bs_proxy_auth cookie / Bearer value for ProxyPath (empty = open)
 	RawYAML        []string      // site-relative .yaml files served raw (text/yaml) instead of rendered as pages
 	AllowIPs       []*net.IPNet  // client IP allowlist (IPs/CIDRs); empty = allow all
+	AuthEmail      string        // passwordless auth recipient; when set, the vhost is gated behind an emailed login code (empty = no auth gate)
+	AuthSMTP       string        // SMTP relay host:port used to send login codes (default b.stg.net:25)
+	AuthFrom       string        // From/envelope sender for login-code mail (default = AuthEmail)
+	AuthSecret     []byte        // HMAC key that signs bs_auth cookies, loaded from auth-secret-file
+	AuthPublic     []string      // extra always-public path prefixes, beyond the built-in splash/asset set
+	AuthTTL        time.Duration // bs_auth cookie lifetime (default 7 days)
 }
 
 // loadConfigMap loads a _config.yaml file and returns its contents as a map.
@@ -226,6 +232,40 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 			s.AllowIPs = append(s.AllowIPs, parseIPNets(lines)...)
 		} else {
 			log.Printf("Warning: allow-ip-file %q unreadable: %v", v, err)
+		}
+	}
+	// Passwordless auth gate. When auth-email is set, the vhost is reachable
+	// from any IP but every path outside the always-public set (splash, /auth/*,
+	// assets) requires a valid bs_auth cookie, obtained via a one-time code
+	// mailed to auth-email. See auth.go. Enabling requires a signing secret; if
+	// auth-secret-file is missing it is generated (0600) and persisted so the
+	// 7-day cookies survive restarts.
+	if v, ok := configString(m, "auth-email", ""); ok && v != "" {
+		s.AuthEmail = v
+		s.AuthSMTP = "b.stg.net:25"
+		s.AuthFrom = v
+		s.AuthTTL = 7 * 24 * time.Hour
+		if sv, ok := configString(m, "auth-smtp", ""); ok && sv != "" {
+			s.AuthSMTP = sv
+		}
+		if fv, ok := configString(m, "auth-from", ""); ok && fv != "" {
+			s.AuthFrom = fv
+		}
+		if dv, ok := configInt(m, "auth-ttl-days", 0); ok && dv > 0 {
+			s.AuthTTL = time.Duration(dv) * 24 * time.Hour
+		}
+		if pv, ok := configIndex(m, "auth-public"); ok {
+			s.AuthPublic = normalizePathPatterns(pv)
+		}
+		secretFile, _ := configString(m, "auth-secret-file", "")
+		if secretFile == "" {
+			log.Printf("Warning: auth-email set but auth-secret-file missing — auth gate disabled for this vhost")
+			s.AuthEmail = ""
+		} else if secret, err := loadOrCreateSecret(secretFile); err != nil {
+			log.Printf("Warning: auth-secret-file %q unusable: %v — auth gate disabled for this vhost", secretFile, err)
+			s.AuthEmail = ""
+		} else {
+			s.AuthSecret = secret
 		}
 	}
 	return s
