@@ -20,6 +20,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -37,7 +38,7 @@ import (
 const (
 	authCookieName  = "bs_auth"
 	authCodeTTL     = 10 * time.Minute
-	authCodeMaxTry  = 5               // wrong-code guesses before a code is burned
+	authCodeMaxTry  = 5                // wrong-code guesses before a code is burned
 	authSendMinGap  = 30 * time.Second // minimum spacing between code emails
 	authSendPerHour = 5                // max code emails per hour
 	authDialTimeout = 20 * time.Second
@@ -180,10 +181,18 @@ func authPublic(p string, s siteSettings) bool {
 
 // safeNext sanitizes a post-login redirect target so it can only point back into
 // this site — a leading single slash and no scheme/host — defeating open
-// redirects like //evil.com or https://evil.com.
+// redirects like //evil.com or https://evil.com. Backslashes are rejected
+// anywhere because browsers normalize \ to / when parsing a Location header,
+// so /\evil.com would become the protocol-relative //evil.com; control bytes
+// are rejected as header-injection hygiene.
 func safeNext(next string) string {
 	if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
 		return "/"
+	}
+	for i := 0; i < len(next); i++ {
+		if next[i] == '\\' || next[i] < 0x20 {
+			return "/"
+		}
 	}
 	return next
 }
@@ -197,7 +206,19 @@ type authCodeEntry struct {
 	sentLog []time.Time // send timestamps within the trailing hour, for rate limiting
 }
 
-var authCodes sync.Map // email -> *authCodeEntry (this site has one recipient, but keying by email keeps it general)
+// authCodes is guarded by authCodesMu: issueCode and checkCode both mutate
+// entry fields (hash, tries, sentLog), so concurrent /auth/send and
+// /auth/verify requests must serialize on the same lock.
+var (
+	authCodesMu sync.Mutex
+	authCodes   = map[string]*authCodeEntry{} // email -> entry (one recipient per site, but keying by email keeps it general)
+)
+
+func deleteAuthCode(email string) {
+	authCodesMu.Lock()
+	defer authCodesMu.Unlock()
+	delete(authCodes, email)
+}
 
 func newAuthCode() string {
 	var b [4]byte
@@ -208,13 +229,25 @@ func newAuthCode() string {
 	return fmt.Sprintf("%06d", binary.BigEndian.Uint32(b[:])%1_000_000)
 }
 
+// authUserError marks a refusal whose text is safe to show the visitor
+// (rate-limit notices). Anything else — notably SMTP transport errors, which
+// embed relay hostnames/IPs — is logged but shown as a generic failure.
+type authUserError struct{ msg string }
+
+func (e authUserError) Error() string { return e.msg }
+
 // issueCode enforces the send rate limits, mints a fresh code, stores its hash,
 // and returns the plaintext to mail. The returned error is a user-facing reason
 // when a send is refused (too frequent / hourly cap).
 func issueCode(email string) (string, error) {
 	now := time.Now()
-	v, _ := authCodes.LoadOrStore(email, &authCodeEntry{})
-	e := v.(*authCodeEntry)
+	authCodesMu.Lock()
+	defer authCodesMu.Unlock()
+	e := authCodes[email]
+	if e == nil {
+		e = &authCodeEntry{}
+		authCodes[email] = e
+	}
 
 	// Prune send log to the trailing hour, then apply the two limits.
 	kept := e.sentLog[:0]
@@ -225,15 +258,15 @@ func issueCode(email string) (string, error) {
 	}
 	e.sentLog = kept
 	if len(e.sentLog) > 0 && now.Sub(e.sentLog[len(e.sentLog)-1]) < authSendMinGap {
-		return "", fmt.Errorf("please wait a moment before requesting another code")
+		return "", authUserError{"please wait a moment before requesting another code"}
 	}
 	if len(e.sentLog) >= authSendPerHour {
-		return "", fmt.Errorf("too many codes requested; try again later")
+		return "", authUserError{"too many codes requested; try again later"}
 	}
 
 	code := newAuthCode()
 	if code == "" {
-		return "", fmt.Errorf("could not generate a code")
+		return "", authUserError{"could not generate a code; try again"}
 	}
 	e.hash = sha256.Sum256([]byte(code))
 	e.expiry = now.Add(authCodeTTL)
@@ -245,18 +278,19 @@ func issueCode(email string) (string, error) {
 // checkCode verifies a submitted code, consuming it on success and burning it
 // after too many wrong guesses.
 func checkCode(email, code string) bool {
-	v, ok := authCodes.Load(email)
+	authCodesMu.Lock()
+	defer authCodesMu.Unlock()
+	e, ok := authCodes[email]
 	if !ok {
 		return false
 	}
-	e := v.(*authCodeEntry)
 	if time.Now().After(e.expiry) || e.tries >= authCodeMaxTry {
-		authCodes.Delete(email)
+		delete(authCodes, email)
 		return false
 	}
 	got := sha256.Sum256([]byte(strings.TrimSpace(code)))
 	if subtle.ConstantTimeCompare(got[:], e.hash[:]) == 1 {
-		authCodes.Delete(email) // single use
+		delete(authCodes, email) // single use
 		return true
 	}
 	e.tries++
@@ -364,7 +398,14 @@ func authSend(w http.ResponseWriter, r *http.Request, s siteSettings) {
 	// but the SMTP deadline bounds how long that can take.
 	if err := sendLoginCode(s); err != nil {
 		log.Printf("auth: sending login code to %s failed: %v", s.AuthEmail, err)
-		authLoginPage(w, r, s, err.Error())
+		// Show rate-limit refusals verbatim, but never raw transport errors:
+		// a dial failure would hand any visitor the relay's host/IP.
+		msg := "Could not send the code right now. Please try again later."
+		var ue authUserError
+		if errors.As(err, &ue) {
+			msg = ue.msg
+		}
+		authLoginPage(w, r, s, msg)
 		return
 	}
 	http.Redirect(w, r, "/auth/login?sent=1&next="+urlQueryEscape(next), http.StatusSeeOther)

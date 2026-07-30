@@ -65,13 +65,17 @@ func TestAuthTokenTampering(t *testing.T) {
 
 func TestSafeNext(t *testing.T) {
 	cases := map[string]string{
-		"/recipe?list":       "/recipe?list",
-		"/":                  "/",
-		"":                   "/",
-		"//evil.com":         "/",       // protocol-relative open redirect
-		"https://evil.com":   "/",       // absolute URL
-		"javascript:alert(1)": "/",      // scheme injection
-		"/a/b/c":             "/a/b/c",
+		"/recipe?list":        "/recipe?list",
+		"/":                   "/",
+		"":                    "/",
+		"//evil.com":          "/", // protocol-relative open redirect
+		"https://evil.com":    "/", // absolute URL
+		"javascript:alert(1)": "/", // scheme injection
+		"/a/b/c":              "/a/b/c",
+		"/\\evil.com":         "/", // browsers normalize \ to / => //evil.com
+		"/\\/evil.com":        "/", // same, with an extra slash
+		"/a\\b":               "/", // backslash anywhere is rejected
+		"/a\r\nSet-Cookie: x": "/", // control bytes rejected
 	}
 	for in, want := range cases {
 		if got := safeNext(in); got != want {
@@ -82,7 +86,7 @@ func TestSafeNext(t *testing.T) {
 
 func TestCodeIssueAndCheck(t *testing.T) {
 	email := "codetest@stg.net" // unique key so other tests don't interfere
-	authCodes.Delete(email)
+	deleteAuthCode(email)
 
 	code, err := issueCode(email)
 	if err != nil {
@@ -104,7 +108,7 @@ func TestCodeIssueAndCheck(t *testing.T) {
 
 func TestCodeSendRateLimit(t *testing.T) {
 	email := "ratetest@stg.net"
-	authCodes.Delete(email)
+	deleteAuthCode(email)
 
 	if _, err := issueCode(email); err != nil {
 		t.Fatalf("first issue should succeed: %v", err)
