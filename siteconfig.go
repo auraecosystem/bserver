@@ -16,27 +16,28 @@ import (
 // siteSettings holds per-site configuration that can be overridden by each
 // virtual host's _config.yaml. Server-wide defaults come from www/_config.yaml.
 type siteSettings struct {
-	CacheAge       time.Duration
-	StaticAge      time.Duration
-	ParentLevels   int
-	Index          []string
-	Types          []string      // allowed file extensions (without dots), e.g. ["html", "css", "jpg"]
-	PHPTimeout     time.Duration // idle timeout: kill php-cgi if no output for this long
-	PHPStreamAfter time.Duration // buffer php-cgi output for this long before switching to chunked streaming
-	AllowHTTP      bool          // serve this vhost over plain HTTP instead of redirecting to HTTPS
-	BlockedPaths   []string      // extra path patterns to deny, beyond the built-in dotfile/vendor defaults
-	AllowedPaths   []string      // path patterns to exempt from blocking, overriding the defaults and BlockedPaths
-	ProxyPath      string        // request path prefix reverse-proxied to ProxyBackend (e.g. "/terminal/")
-	ProxyBackend   string        // host:port backend that ProxyPath forwards to
-	ProxyKey       string        // required bs_proxy_auth cookie / Bearer value for ProxyPath (empty = open)
-	RawYAML        []string      // site-relative .yaml files served raw (text/yaml) instead of rendered as pages
-	AllowIPs       []*net.IPNet  // client IP allowlist (IPs/CIDRs); empty = allow all
-	AuthEmail      string        // passwordless auth recipient; when set, the vhost is gated behind an emailed login code (empty = no auth gate)
-	AuthSMTP       string        // SMTP relay host:port used to send login codes (default b.stg.net:25)
-	AuthFrom       string        // From/envelope sender for login-code mail (default = AuthEmail)
-	AuthSecret     []byte        // HMAC key that signs bs_auth cookies, loaded from auth-secret-file
-	AuthPublic     []string      // extra always-public path prefixes, beyond the built-in splash/asset set
-	AuthTTL        time.Duration // bs_auth cookie lifetime (default 7 days)
+	CacheAge          time.Duration
+	StaticAge         time.Duration
+	ParentLevels      int
+	Index             []string
+	Types             []string      // allowed file extensions (without dots), e.g. ["html", "css", "jpg"]
+	PHPTimeout        time.Duration // idle timeout: kill php-cgi if no output for this long
+	PHPStreamAfter    time.Duration // buffer php-cgi output for this long before switching to chunked streaming
+	AllowHTTP         bool          // serve this vhost over plain HTTP instead of redirecting to HTTPS
+	BlockedPaths      []string      // extra path patterns to deny, beyond the built-in dotfile/vendor defaults
+	AllowedPaths      []string      // path patterns to exempt from blocking, overriding the defaults and BlockedPaths
+	ProxyPath         string        // request path prefix reverse-proxied to ProxyBackend (e.g. "/terminal/")
+	ProxyBackend      string        // host:port backend that ProxyPath forwards to
+	ProxyKey          string        // required bs_proxy_auth cookie / Bearer value for ProxyPath (empty = open)
+	ProxyAllowPrivate bool          // allow ProxyBackend to be a loopback/private/link-local address
+	RawYAML           []string      // site-relative .yaml files served raw (text/yaml) instead of rendered as pages
+	AllowIPs          []*net.IPNet  // client IP allowlist (IPs/CIDRs); empty = allow all
+	AuthEmail         string        // passwordless auth recipient; when set, the vhost is gated behind an emailed login code (empty = no auth gate)
+	AuthSMTP          string        // SMTP relay host:port used to send login codes (default b.stg.net:25)
+	AuthFrom          string        // From/envelope sender for login-code mail (default = AuthEmail)
+	AuthSecret        []byte        // HMAC key that signs bs_auth cookies, loaded from auth-secret-file
+	AuthPublic        []string      // extra always-public path prefixes, beyond the built-in splash/asset set
+	AuthTTL           time.Duration // bs_auth cookie lifetime (default 7 days)
 }
 
 // loadConfigMap loads a _config.yaml file and returns its contents as a map.
@@ -213,6 +214,9 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 		} else {
 			log.Printf("Warning: proxy-path-key-file %q unreadable: %v", v, err)
 		}
+	}
+	if v, ok := configBool(m, "proxy-path-allow-private", false); ok {
+		s.ProxyAllowPrivate = v
 	}
 	// Client IP allowlist. When set, only listed IPs/CIDRs may reach this vhost
 	// at all (pages, static files, and proxied paths). The list can be given
