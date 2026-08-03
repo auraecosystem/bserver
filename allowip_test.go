@@ -7,10 +7,10 @@ func TestIPAllowlist(t *testing.T) {
 	if !ipAllowed("8.8.8.8", nil) {
 		t.Error("empty allowlist should allow all")
 	}
-	nets := parseIPNets([]string{"152.42.32.51", "10.0.0.0/8", "::1", "garbage", "999.1.1.1"})
+	nets := parseIPNets([]string{"203.0.113.51", "10.0.0.0/8", "::1", "garbage", "999.1.1.1"})
 	cases := map[string]bool{
-		"152.42.32.51": true,  // exact IPv4
-		"152.42.32.52": false, // neighbor not allowed
+		"203.0.113.51": true,  // exact IPv4
+		"203.0.113.52": false, // neighbor not allowed
 		"10.5.6.7":     true,  // inside CIDR
 		"11.0.0.1":     false, // outside CIDR
 		"::1":          true,  // IPv6 loopback

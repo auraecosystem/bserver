@@ -297,7 +297,7 @@ MemoryMax=${mem_max_kb}K"
     # PHP session storage. bserver runs php-cgi as "nobody" after dropping
     # privileges, and PrivateTmp=yes wipes /tmp on every restart — so we
     # use a persistent per-service directory owned by nobody. Sessions
-    # (including the Google OAuth access/refresh token for crm.stg.net)
+    # (including any OAuth access/refresh tokens an app keeps in them)
     # survive restarts as long as the session cookie is still valid.
     local session_dir="/var/lib/${SERVICE_NAME}-sessions"
     if [ ! -d "$session_dir" ]; then

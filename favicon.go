@@ -141,7 +141,7 @@ func parseColor(s string) color.RGBA {
 
 // docRootToFaviconText derives default favicon text from the virtual host directory name.
 // Takes the first 3 characters before any dot, uppercased.
-// Examples: "stg.net" → "STG", "default" → "DEF", "example.com" → "EXA"
+// Examples: "mysite.net" → "MYS", "default" → "DEF", "example.com" → "EXA"
 func docRootToFaviconText(docRoot string) string {
 	name := filepath.Base(docRoot)
 	name = strings.ToUpper(name)
