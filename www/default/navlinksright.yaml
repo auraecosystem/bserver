@@ -3,9 +3,9 @@ navlinksright:
     https://github.com/stgnet/bserver/:
       - fa-brands-github
       - Repo
-    'mailto:scott@stg.net':
+    https://github.com/stgnet/bserver/issues:
       - fa-regular-envelope
-      - Author
+      - Issues
     https://claude.ai/:
       - fa-solid-robot
       - Assistant

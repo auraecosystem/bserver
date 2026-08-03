@@ -219,9 +219,9 @@ navlinksright:
     https://github.com/stgnet/bserver/:
       - fa-brands-github
       - Repo
-    "mailto:scott@stg.net":
+    "mailto:hello@example.com":
       - fa-regular-envelope
-      - Author
+      - Contact
   "/settings": Settings
 ```
 

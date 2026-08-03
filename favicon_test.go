@@ -44,7 +44,7 @@ func TestDocRootToFaviconText(t *testing.T) {
 		input string
 		want  string
 	}{
-		{"/srv/stg.net", "STG"},
+		{"/srv/mysite.net", "MYS"},
 		{"/srv/default", "DEF"},
 		{"/srv/example.com", "EXA"},
 		{"/srv/ab", "AB"},
@@ -61,13 +61,13 @@ func TestDocRootToFaviconText(t *testing.T) {
 
 func TestLoadFaviconConfigDefaults(t *testing.T) {
 	dir := t.TempDir()
-	// Create a "stg.net" subdirectory to simulate docRoot
-	docRoot := filepath.Join(dir, "stg.net")
+	// Create a "mysite.net" subdirectory to simulate docRoot
+	docRoot := filepath.Join(dir, "mysite.net")
 	os.Mkdir(docRoot, 0755)
 
 	cfg, yamlTime := loadFaviconConfig(docRoot)
-	if cfg.Text != "STG" {
-		t.Errorf("default text = %q, want %q", cfg.Text, "STG")
+	if cfg.Text != "MYS" {
+		t.Errorf("default text = %q, want %q", cfg.Text, "MYS")
 	}
 	if cfg.Color != "white" {
 		t.Errorf("default color = %q, want %q", cfg.Color, "white")
@@ -261,7 +261,7 @@ func TestGetCachedFavicon(t *testing.T) {
 
 func TestServeFaviconHTTP(t *testing.T) {
 	dir := t.TempDir()
-	docRoot := filepath.Join(dir, "stg.net")
+	docRoot := filepath.Join(dir, "mysite.net")
 	os.Mkdir(docRoot, 0755)
 
 	cfg := &config{
@@ -273,7 +273,7 @@ func TestServeFaviconHTTP(t *testing.T) {
 	}
 	mux := &virtualHostMux{cfg: cfg}
 
-	req := httptest.NewRequest("GET", "http://stg.net/favicon.ico", nil)
+	req := httptest.NewRequest("GET", "http://mysite.net/favicon.ico", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 

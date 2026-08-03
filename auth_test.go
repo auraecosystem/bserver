@@ -14,7 +14,7 @@ import (
 
 func TestAuthTokenRoundTrip(t *testing.T) {
 	secret := []byte("test-secret-key-01234567890123456789")
-	email := "crystal@stg.net"
+	email := "crystal@example.com"
 	now := time.Unix(1_700_000_000, 0)
 	tok := makeAuthToken(secret, email, now.Add(7*24*time.Hour))
 
@@ -29,7 +29,7 @@ func TestAuthTokenRoundTrip(t *testing.T) {
 
 func TestAuthTokenExpiry(t *testing.T) {
 	secret := []byte("test-secret-key-01234567890123456789")
-	email := "crystal@stg.net"
+	email := "crystal@example.com"
 	issued := time.Unix(1_700_000_000, 0)
 	tok := makeAuthToken(secret, email, issued.Add(time.Hour))
 
@@ -43,7 +43,7 @@ func TestAuthTokenExpiry(t *testing.T) {
 
 func TestAuthTokenTampering(t *testing.T) {
 	secret := []byte("test-secret-key-01234567890123456789")
-	email := "crystal@stg.net"
+	email := "crystal@example.com"
 	now := time.Unix(1_700_000_000, 0)
 	tok := makeAuthToken(secret, email, now.Add(time.Hour))
 
@@ -81,7 +81,7 @@ func TestAuthCookieRequiresApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := siteSettings{
-		AuthEmail:     "crystal@stg.net",
+		AuthEmail:     "crystal@example.com",
 		AuthSecret:    []byte("test-secret-key-01234567890123456789"),
 		AuthUsersFile: usersFile,
 	}
@@ -93,7 +93,7 @@ func TestAuthCookieRequiresApproval(t *testing.T) {
 		return r
 	}
 
-	for _, email := range []string{"crystal@stg.net", "friend@example.com"} {
+	for _, email := range []string{"crystal@example.com", "friend@example.com"} {
 		got, ok := validAuthCookie(req(email), s)
 		if !ok {
 			t.Errorf("approved address %q should hold a session", email)
@@ -116,7 +116,7 @@ func TestAuthCookieRequiresApproval(t *testing.T) {
 	}
 	// The owner address is never revocable this way, so the site cannot be
 	// locked out by an empty or broken users file.
-	if _, ok := validAuthCookie(req("crystal@stg.net"), s); !ok {
+	if _, ok := validAuthCookie(req("crystal@example.com"), s); !ok {
 		t.Error("owner address must keep access regardless of the users file")
 	}
 }
@@ -127,14 +127,14 @@ func TestAuthAllowedNormalizesCase(t *testing.T) {
 	if err := os.WriteFile(usersFile, []byte("  Friend@Example.COM  \n\n# a comment\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s := siteSettings{AuthEmail: "Crystal@STG.net", AuthUsersFile: usersFile}
+	s := siteSettings{AuthEmail: "Crystal@EXAMPLE.com", AuthUsersFile: usersFile}
 
 	for _, addr := range []string{"friend@example.com", "FRIEND@EXAMPLE.COM", " friend@example.com "} {
 		if !authAllowed(s, addr) {
 			t.Errorf("%q should match the approved address regardless of case/space", addr)
 		}
 	}
-	if !authAllowed(s, "crystal@stg.net") {
+	if !authAllowed(s, "crystal@example.com") {
 		t.Error("owner address should match case-insensitively too")
 	}
 	if authAllowed(s, "") || authAllowed(s, "# a comment") {
@@ -145,8 +145,8 @@ func TestAuthAllowedNormalizesCase(t *testing.T) {
 // A missing users file must fail closed — only the owner may sign in — rather
 // than being read as "no restrictions".
 func TestAuthUsersFileMissingFailsClosed(t *testing.T) {
-	s := siteSettings{AuthEmail: "crystal@stg.net", AuthUsersFile: "/nonexistent/nope"}
-	if !authAllowed(s, "crystal@stg.net") {
+	s := siteSettings{AuthEmail: "crystal@example.com", AuthUsersFile: "/nonexistent/nope"}
+	if !authAllowed(s, "crystal@example.com") {
 		t.Error("owner must still be allowed when the users file is missing")
 	}
 	if authAllowed(s, "anyone@example.com") {
@@ -165,11 +165,11 @@ func TestProxyPathUsersFile(t *testing.T) {
 	if err := os.WriteFile(usersFile, []byte("friend@example.com\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(superFile, []byte("crystal@stg.net\n"), 0o600); err != nil {
+	if err := os.WriteFile(superFile, []byte("crystal@example.com\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s := siteSettings{
-		AuthEmail:      "crystal@stg.net",
+		AuthEmail:      "crystal@example.com",
 		AuthSecret:     []byte("test-secret-key-01234567890123456789"),
 		AuthUsersFile:  usersFile,
 		ProxyPathUsers: superFile,
@@ -178,7 +178,7 @@ func TestProxyPathUsersFile(t *testing.T) {
 	if !authAllowed(s, "friend@example.com") {
 		t.Fatal("precondition: friend should be able to sign in at all")
 	}
-	if !loadAuthUsers(s.ProxyPathUsers)["crystal@stg.net"] {
+	if !loadAuthUsers(s.ProxyPathUsers)["crystal@example.com"] {
 		t.Error("listed address should be allowed through to the proxy")
 	}
 	if loadAuthUsers(s.ProxyPathUsers)["friend@example.com"] {
@@ -403,7 +403,7 @@ func TestAuthLoginOverlay(t *testing.T) {
 }
 
 func TestPlausibleEmail(t *testing.T) {
-	ok := []string{"a@b.co", "crystal@stg.net", "first.last+tag@sub.example.org"}
+	ok := []string{"a@b.co", "crystal@example.com", "first.last+tag@sub.example.org"}
 	bad := []string{
 		"", "nope", "@example.com", "user@", "user@localhost",
 		"user@example.com\r\nBcc: victim@example.com", // header injection
@@ -473,7 +473,7 @@ func TestSafeNext(t *testing.T) {
 }
 
 func TestCodeIssueAndCheck(t *testing.T) {
-	email := "codetest@stg.net" // unique key so other tests don't interfere
+	email := "codetest@example.com" // unique key so other tests don't interfere
 	deleteAuthCode(email)
 
 	code, err := issueCode(email)
@@ -495,7 +495,7 @@ func TestCodeIssueAndCheck(t *testing.T) {
 }
 
 func TestCodeSendRateLimit(t *testing.T) {
-	email := "ratetest@stg.net"
+	email := "ratetest@example.com"
 	deleteAuthCode(email)
 
 	if _, err := issueCode(email); err != nil {
@@ -511,7 +511,7 @@ func TestCodeSendRateLimit(t *testing.T) {
 
 func TestMaskEmail(t *testing.T) {
 	cases := map[string]string{
-		"crystal@stg.net": "c*****l@stg.net",
+		"crystal@example.com": "c*****l@example.com",
 		"ab@x.com":        "a***@x.com",
 		"a@x.com":         "a***@x.com",
 	}

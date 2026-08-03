@@ -18,7 +18,9 @@ set -euo pipefail
 
 LOG_FILE="${BSERVER_LOG:-/var/log/bserver.log}"
 STATE_FILE="${BSERVER_MEMCHECK_STATE:-/var/lib/bserver-diag/memcheck.state}"
-RECIPIENT="${BSERVER_MEMCHECK_TO:-scott@stg.net}"
+# Alert recipient — set BSERVER_MEMCHECK_TO to your address (defaults to
+# the local root mailbox).
+RECIPIENT="${BSERVER_MEMCHECK_TO:-root}"
 FROM="${BSERVER_MEMCHECK_FROM:-bserver@$(hostname -f 2>/dev/null || hostname)}"
 HOST="$(hostname -f 2>/dev/null || hostname)"
 SENDMAIL="${SENDMAIL:-/usr/sbin/sendmail}"

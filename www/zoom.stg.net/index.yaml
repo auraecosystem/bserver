@@ -1,6 +1,0 @@
-+head:
-  - redirect: https://stg.net/zoom
-main:
-  - p: "Redirecting..."
-  - links:
-      https://stg.net/zoom: stg.net/zoom
