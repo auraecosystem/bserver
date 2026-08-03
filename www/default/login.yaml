@@ -1,0 +1,36 @@
+# login.yaml — demo of the passwordless-auth sign-in dialog.
+#
+# On a gated vhost (one with an _auth.yaml), this dialog is served at
+# /auth/login by rendering the auth-login definition from auth-login.yaml —
+# the server contains no HTML for it. This page renders the same definition
+# with sample values so the dialog can be seen and restyled without enabling
+# the gate. The forms post to /auth/*, which only exists on gated sites, so
+# the buttons lead to a 404 here.
+#
+# To customize a real site's dialog: copy www/auth-login.yaml into the site's
+# document root and edit it, or define the same names under login: in the
+# site's _auth.yaml.
+
+main:
+  - markdown: |
+      ## Sign-in dialog demo
+
+      This is the default `auth-login` dialog from `www/auth-login.yaml`,
+      rendered with sample values (the notice, the pre-filled address, and the
+      email field that appears on multi-user sites). See **Features →
+      Vhost Authentication** for how the auth gate and `_auth.yaml` work.
+  - auth-login
+
+# Sample stand-ins for the definitions the auth system seeds at /auth/login:
+authnext: /login
+authemail: demo@example.com
+authmasked: d**o@example.com
+authnotice: A login code was sent to d**o@example.com. Enter it below.
+authnoticeclass: ok
+authnoticeblock:
+  - auth-notice
+authemailblock:
+  - auth-email-field
+authemailcarry:
+  - auth-email-carry
+authfocuscode: autofocus

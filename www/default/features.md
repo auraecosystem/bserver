@@ -256,35 +256,67 @@ block-paths:
 
 ## Vhost Authentication
 
-A virtual host can be placed behind a passwordless login by setting `auth-email`
-in its `_config.yaml`. When set, the host stays reachable from any IP, but every
-path outside the always-public set (the splash page `/`, `/favicon.ico`,
+A virtual host can be placed behind a passwordless login by creating an
+`_auth.yaml` in its document root — one file that controls everything about the
+gate. Like `_config.yaml`, the underscore prefix means it can never be served
+as web content. When `email:` is set, the host stays reachable from any IP, but
+every path outside the always-public set (the splash page `/`, `/favicon.ico`,
 `/robots.txt`, anything under `/.well-known/`, the `/auth/*` login endpoints,
-and any prefixes you add via `auth-public`) requires a valid session cookie.
+and any prefixes you add via `public:`) requires a valid session cookie.
 
-A visitor signs in by requesting a one-time 6-digit code, which is emailed to
-`auth-email`, and entering it. On success bserver sets `bs_auth` — an
+A visitor signs in by requesting a one-time 6-digit code, which is delivered to
+an approved address, and entering it. On success bserver sets `bs_auth` — an
 HMAC-signed cookie carrying the address and an expiry — so the session is
 verified statelessly on every request and survives restarts. The cookie lasts
-`auth-ttl-days` (default 7) before a fresh code is needed. `/auth/logout` clears
-it. Codes expire after 10 minutes, are single-use, are burned after 5 wrong
-guesses, and are rate-limited (no more than one per 30 s or five per hour).
+`ttl-days` (default 7) before a fresh code is needed. `/auth/logout` clears it.
+Codes expire after 10 minutes, are single-use, are burned after 5 wrong
+guesses, and are rate-limited (per address and globally).
 
 | Setting | Description |
 |---------|-------------|
-| `auth-email` | Recipient of login codes. **Presence enables the gate.** |
-| `auth-smtp` | SMTP relay `host:port` for sending codes (default `b.stg.net:25`). Plain SMTP to a trusted relay — no auth/STARTTLS is attempted. |
-| `auth-from` | `From`/envelope sender for the code email (default = `auth-email`). |
-| `auth-secret-file` | Path (keep it **outside** the webroot) to the cookie-signing key. Auto-created `0600` with 32 random bytes if missing, and persisted so 7-day cookies survive restarts. **Required** — the gate stays off if it is missing or unusable. |
-| `auth-public` | Extra always-public path prefixes, beyond the built-in set. |
-| `auth-ttl-days` | Session cookie lifetime in days (default `7`). |
+| `email` | Owner address. **Presence enables the gate.** Always allowed to sign in, so a broken users list can never lock the site out. |
+| `secret-file` | Path (keep it **outside** the webroot) to the cookie-signing key. Auto-created `0600` with 32 random bytes if missing, and persisted so cookies survive restarts. **Required** — the gate stays off if it is missing or unusable. |
+| `users` | Inline list of additional approved addresses. |
+| `users-file` | File of additional approved addresses (one per line, `#` comments). Your app can maintain it; removing an address revokes on the next request. |
+| `allow` | Shell script deciding whether an address may sign in — e.g. a database lookup. Runs with `AUTH_EMAIL` in the environment; exit `0` allows. Verdicts are cached for a minute. |
+| `send` | Shell script that delivers the code, replacing the built-in mailer — e.g. local sendmail, an SMS gateway, an API call. Runs with `AUTH_EMAIL`, `AUTH_CODE`, `AUTH_FROM`. |
+| `smtp` | SMTP relay `host:port` for the built-in mailer (default `localhost:25`). Plain SMTP to a trusted relay — no auth/STARTTLS is attempted. |
+| `from` | `From`/envelope sender for the code email (default = `email`). |
+| `mail-subject`, `mail-body` | Text of the code email; `$code` in the body is replaced with the code. |
+| `public` | Extra always-public path prefixes, beyond the built-in set. |
+| `ttl-days` | Session cookie lifetime in days (default `7`). |
+| `login` | Inline page definitions for the sign-in dialog (see below). |
 
 ```yaml
-# www/example.com/_config.yaml
-auth-email: owner@example.com
-auth-secret-file: /var/lib/bserver-secrets/example-auth   # not under the webroot
-auth-ttl-days: 7
+# www/example.com/_auth.yaml
+email: owner@example.com
+secret-file: /var/lib/bserver-secrets/example-auth   # not under the webroot
+users:
+  - friend@example.com
+allow: ./check-user.sh          # optional: ask a script/database instead
+send: |                         # optional: deliver the code yourself
+  printf 'Subject: Your code\n\nCode: %s\n' "$AUTH_CODE" | sendmail "$AUTH_EMAIL"
 ```
+
+(The original `auth-email`, `auth-smtp`, `auth-from`, `auth-secret-file`,
+`auth-public`, `auth-ttl-days`, and `auth-users-file` keys in `_config.yaml`
+still work; `_auth.yaml` values override them.)
+
+When more than one address can sign in (any of `users`, `users-file`, or
+`allow` is configured), the login form asks which address is signing in and
+refuses to send codes to unapproved ones. The verified address reaches PHP
+apps as `$_SERVER['REMOTE_USER']`, and `proxy-path-users-file` in
+`_config.yaml` can restrict a proxied path to specific signed-in users.
+
+### The sign-in dialog is a page, not server code
+
+`/auth/login` renders the `auth-login` definition through the normal YAML
+pipeline — no HTML for it lives in the server. The default is
+`www/auth-login.yaml`; a site overrides it with its own `auth-login.yaml`, or
+inline under `login:` in its `_auth.yaml`. The [login demo](/login) on this
+site renders the default dialog with sample values so you can see what you are
+restyling. The template's header comments document the `$auth...` values the
+server seeds (redirect target, address, notices, focus).
 
 The gate runs before proxy handling and before the render cache is consulted, so
 a path-based reverse proxy (e.g. a `/terminal/` web shell) is covered too, and a

@@ -89,6 +89,32 @@ output) — could break out of the tag and inject markup.
 
 ---
 
+## Follow-up Note (2026-08-03): `_auth.yaml` script hooks and YAML login page
+
+The passwordless-auth refactor introduced two operator-defined shell hooks
+(`allow:` and `send:` in `_auth.yaml`) and moved the login dialog into the
+YAML render pipeline. Security posture:
+
+- **Hook trust model** matches finding #1: `_auth.yaml` lives beside
+  `_config.yaml` and is authored by the site operator, who already holds
+  arbitrary code execution via YAML script definitions. Hooks add no new
+  privilege.
+- **Visitor data never touches the command line.** The address and code are
+  passed only via `AUTH_EMAIL` / `AUTH_CODE` environment variables; addresses
+  are pre-filtered by `plausibleEmail` (no control bytes or spaces). Hooks run
+  with hard timeouts, and `allow:` fails closed (any error or non-zero exit
+  denies; the owner address never depends on the hook).
+- **`_auth.yaml` is never web-served** — the underscore prefix is in the
+  built-in deny set, like `_config.yaml`. Operators can still expose it via
+  `raw-yaml`/`allow-paths`; do not.
+- **Login page injection:** all runtime values ($authnext, $authemail,
+  notices) enter the page through the renderer's normal escaping (attribute
+  values via `paramsWithVars` → `html.EscapeString`, text via content
+  escaping). The redirect target remains sanitized by `safeNext` before it is
+  seeded.
+
+---
+
 ## Critical Findings
 
 ### 1. Arbitrary Code Execution via YAML Script Definitions (script.go, datasource.go)

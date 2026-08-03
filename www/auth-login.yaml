@@ -1,0 +1,213 @@
+# auth-login.yaml — sign-in page for the passwordless auth gate.
+#
+# This is the server-wide default. No HTML for this dialog lives in the server
+# itself; a site customizes it by shipping its own auth-login.yaml in its
+# document root, or by defining the same names under the login: section of its
+# _auth.yaml — either way, definitions there win over this file. The page
+# renders through the normal YAML pipeline (html.yaml, style.yaml, the site's
+# own overrides), so the site's usual chrome applies. See www/default/login.yaml
+# for a customization demo.
+#
+# The auth system pre-seeds these definitions. $varname works in content and
+# inside format params; a param whose $var stays undefined is omitted, which is
+# how autofocus lands on exactly one field.
+#
+#   $authnext        — in-site path to return to after signing in
+#   $authemail       — address being signed in ("" until known)
+#   $authmasked      — masked form of the address ("your address" when unknown)
+#   $authnotice      — status/error text ("" when none)
+#   $authnoticeclass — "ok" or "err", for styling the notice
+#   $authnoticeblock — renders auth-notice when there is a notice, else nothing
+#   $authemailblock  — renders auth-email-field on multi-user sites, else nothing
+#   $authemailcarry  — renders auth-email-carry on multi-user sites, else nothing
+#   $authfocusemail / $authfocuscode — the word "autofocus", seeded on whichever
+#       field should take focus
+#
+# The stand-ins below keep the page presentable if it is browsed directly;
+# when the auth system drives the render, its own values take precedence.
+authnext: /
+authemail: ""
+authmasked: your address
+authnotice: ""
+authnoticeclass: ok
+authnoticeblock:
+authemailblock:
+authemailcarry:
+
+auth-login:
+  - auth-card:
+      - h1: Sign in
+      - auth-sub: This site is private. Signing in emails a one-time code to an approved address.
+      - $authnoticeblock
+      - auth-send-form:
+          - auth-next
+          - $authemailblock
+          - auth-button: Email me a login code
+      - auth-divider: then enter it
+      - auth-verify-form:
+          - auth-next
+          - $authemailcarry
+          - auth-code-label: 6-digit code
+          - auth-code-input
+          - auth-button: Sign in
+      - auth-home: ← Back to home
+
+# Status/error notice; only rendered via $authnoticeblock when a notice exists.
+auth-notice:
+  - $authnotice
+^auth-notice:
+  tag: p
+  params:
+    class: auth-msg $authnoticeclass
+
+# Who is signing in — shown only on multi-user sites via $authemailblock.
+auth-email-field:
+  - auth-email-label: Email address
+  - auth-email-input
+^auth-email-label:
+  tag: label
+  params:
+    for: email
+auth-email-input:
+^auth-email-input:
+  tag: input
+  params:
+    id: email
+    name: email
+    type: email
+    autocomplete: email
+    spellcheck: 'false'
+    placeholder: you@example.com
+    value: $authemail
+    autofocus: $authfocusemail
+
+# Hidden fields carrying the redirect target and chosen address between forms.
+auth-next:
+^auth-next:
+  tag: input
+  params:
+    type: hidden
+    name: next
+    value: $authnext
+auth-email-carry:
+^auth-email-carry:
+  tag: input
+  params:
+    type: hidden
+    name: email
+    value: $authemail
+
+^auth-code-label:
+  tag: label
+  params:
+    for: code
+auth-code-input:
+^auth-code-input:
+  tag: input
+  params:
+    id: code
+    name: code
+    inputmode: numeric
+    autocomplete: one-time-code
+    pattern: '[0-9]*'
+    maxlength: '6'
+    placeholder: '123456'
+    autofocus: $authfocuscode
+
+^auth-card:
+  tag: div
+  params:
+    class: auth-card
+^auth-sub:
+  tag: p
+  params:
+    class: auth-sub
+^auth-send-form:
+  tag: form
+  params:
+    method: post
+    action: /auth/send
+^auth-verify-form:
+  tag: form
+  params:
+    method: post
+    action: /auth/verify
+^auth-divider:
+  tag: div
+  params:
+    class: auth-divider
+^auth-button:
+  tag: button
+  params:
+    type: submit
+    class: auth-button
+^auth-home:
+  tag: a
+  params:
+    class: auth-home
+    href: /
+
+# Styling is merged into the site's style definition rather than replacing it.
++style:
+  .auth-card:
+    max-width: 22rem
+    margin: 3rem auto
+    padding: 2rem
+    border-radius: 14px
+    box-shadow: 0 8px 30px rgba(0,0,0,.12)
+  .auth-sub:
+    margin: 0 0 1.25rem
+    color: '#666'
+  .auth-card form:
+    margin: 0
+  .auth-card label:
+    display: block
+    font-size: .8rem
+    color: '#666'
+    margin: 0 0 .3rem
+  .auth-card input, .auth-card button:
+    font: inherit
+    width: 100%
+    padding: .6rem .7rem
+    border-radius: 9px
+    border: 1px solid #ccc
+  .auth-card input[type=hidden]:
+    display: none
+  .auth-button:
+    border: 0
+    background: '#0a84ff'
+    color: '#fff'
+    font-weight: 600
+    cursor: pointer
+    margin-top: .25rem
+  .auth-button:hover:
+    background: '#0060df'
+  .auth-divider:
+    display: flex
+    align-items: center
+    gap: .75rem
+    margin: 1.25rem 0
+    color: '#999'
+    font-size: .85rem
+  .auth-divider::before, .auth-divider::after:
+    content: '""'
+    flex: 1
+    height: 1px
+    background: '#ddd'
+  .auth-msg:
+    padding: .6rem .7rem
+    border-radius: 9px
+    margin: 0 0 1rem
+    font-size: .9rem
+  .auth-msg.ok:
+    background: '#e7f6ec'
+    color: '#1a7f37'
+  .auth-msg.err:
+    background: '#fdecea'
+    color: '#c0362c'
+  .auth-home:
+    display: block
+    text-align: center
+    margin-top: 1.25rem
+    font-size: .85rem
+    text-decoration: none

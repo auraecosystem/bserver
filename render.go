@@ -256,6 +256,141 @@ func renderErrorPage(docRoot string, statusCode int, message string, debug bool,
 	return sb.String(), ctx.sourceFilesList()
 }
 
+// authLoginState carries the runtime facts the login page needs. The page's
+// markup itself lives entirely in YAML (auth-login.yaml or an _auth.yaml
+// login: section) — Go only supplies these values.
+type authLoginState struct {
+	Next      string // sanitized in-site path to return to after signing in
+	Email     string // address being signed in ("" when not yet known)
+	Notice    string // status/error text ("" when there is none)
+	NoticeErr bool   // notice is an error (vs a "code sent" confirmation)
+	Sent      bool   // a code was just sent — focus belongs on the code field
+	MultiUser bool   // site accepts more than one address (users configured)
+}
+
+// renderAuthLoginPage renders the passwordless-auth login page through the
+// YAML rendering pipeline, so the dialog is site content, not server code.
+// Definition sources, in order of precedence:
+//
+//  1. the login: section of the vhost's _auth.yaml, letting a site keep its
+//     entire auth setup — settings, script hooks, and dialog — in one file;
+//  2. auth-login.yaml, found via the normal upward name search, so a site can
+//     ship its own or fall back to the server-wide default in the www root.
+//
+// The page resolves through html.yaml like any other, so the site's own
+// chrome and styles apply. Returns "" when no auth-login definition is found
+// anywhere; the caller then answers with a plain-text error.
+//
+// Pre-seeded definitions, usable via $varname in content and in format params
+// (e.g. value: $authnext):
+//
+//	authnext        — in-site path to return to after signing in
+//	authemail       — address being signed in ("" until known)
+//	authmasked      — masked display form of the address ("your address" when unknown)
+//	authnotice      — status/error text ("" when none)
+//	authnoticeclass — "ok" or "err", for styling the notice
+//	authnoticeblock — resolves to the template's auth-notice block only when
+//	                  there is a notice, so an empty notice renders nothing
+//	authemailblock  — resolves to the template's auth-email-field block only on
+//	                  multi-user sites, preserving the one-button form elsewhere
+//	authemailcarry  — resolves to the template's auth-email-carry hidden input
+//	                  only on multi-user sites, so the chosen address rides
+//	                  along to the verify step
+//	authfocusemail / authfocuscode — the word "autofocus", seeded on whichever
+//	                  input should take focus; the other stays undefined so its
+//	                  autofocus attribute is omitted from the rendered tag
+func renderAuthLoginPage(docRoot string, st authLoginState, maxParentLevels int, r *http.Request) string {
+	if docRoot == "" {
+		return ""
+	}
+	requestURI := "/auth/login"
+	if r != nil && r.URL != nil {
+		requestURI = r.URL.Path
+	}
+	ctx := &renderContext{
+		docRoot:         docRoot,
+		requestDir:      docRoot,
+		requestURI:      requestURI,
+		httpRequest:     r,
+		maxParentLevels: maxParentLevels,
+		defs:            make(map[string]interface{}),
+		formats:         make(map[string]*formatDef),
+		dataSources:     make(map[string]*dataDef),
+		filesLoaded:     make(map[string]bool),
+		yamlErrors:      make(map[string]string),
+		resolving:       make(map[string]bool),
+	}
+
+	masked := "your address"
+	if st.Email != "" {
+		masked = maskEmail(st.Email)
+	}
+	noticeClass := "ok"
+	if st.NoticeErr {
+		noticeClass = "err"
+	}
+	ctx.defs["authnext"] = st.Next
+	ctx.defs["authemail"] = st.Email
+	ctx.defs["authmasked"] = masked
+	ctx.defs["authnotice"] = st.Notice
+	ctx.defs["authnoticeclass"] = noticeClass
+	ctx.defs["authnoticeblock"] = nil
+	if st.Notice != "" {
+		ctx.defs["authnoticeblock"] = []interface{}{"auth-notice"}
+	}
+	ctx.defs["authemailblock"] = nil
+	ctx.defs["authemailcarry"] = nil
+	if st.MultiUser {
+		ctx.defs["authemailblock"] = []interface{}{"auth-email-field"}
+		ctx.defs["authemailcarry"] = []interface{}{"auth-email-carry"}
+	}
+	if st.MultiUser && !st.Sent {
+		ctx.defs["authfocusemail"] = "autofocus"
+	} else {
+		ctx.defs["authfocuscode"] = "autofocus"
+	}
+
+	// Site dialog definitions from _auth.yaml's login: section take precedence
+	// (mergeDoc is first-loaded-wins) over any auth-login.yaml found below.
+	loadAuthLoginOverlay(ctx, filepath.Join(docRoot, "_auth.yaml"))
+
+	if _, _, ok := ctx.findDefinition("auth-login"); !ok {
+		return ""
+	}
+	ctx.defs["main"] = []interface{}{"auth-login"}
+
+	ctx.resolveAll("html", 0)
+
+	var sb strings.Builder
+	sb.WriteString("<!DOCTYPE html>\n")
+	ctx.renderName(&sb, "html", 0)
+	return sb.String()
+}
+
+// loadAuthLoginOverlay merges the login: section of an _auth.yaml (if present)
+// into the render context as page definitions. Only that section is read —
+// the file's other keys are auth settings, handled by siteconfig.go, and must
+// not leak into the page as definitions.
+func loadAuthLoginOverlay(ctx *renderContext, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	parsed, parseErr := parseYAMLOrdered(data)
+	if parseErr != nil {
+		return // already warned about by the settings loader
+	}
+	doc, ok := parsed.(*OrderedMap)
+	if !ok {
+		return
+	}
+	if section, ok := doc.Get("login"); ok {
+		if m, ok := section.(*OrderedMap); ok {
+			ctx.mergeDoc(m)
+		}
+	}
+}
+
 // renderMarkdownPage renders a markdown file within the full YAML page structure.
 // The markdown content becomes the "main" definition, so it gets the same
 // header, navbar, styles, footer, etc. as YAML pages.
@@ -594,11 +729,18 @@ func isNameRef(s string) bool {
 // where text and inline elements should be rendered on the same line.
 func containsInlineText(items []interface{}) bool {
 	for _, item := range items {
-		if str, ok := item.(string); ok && !isNameRef(str) {
+		if str, ok := item.(string); ok && !isNameRef(str) && !isVarRef(str) {
 			return true
 		}
 	}
 	return false
+}
+
+// isVarRef reports whether s is a $varname definition reference. Such strings
+// are structural (they render the named definition, which may be a whole
+// block), never literal phrasing text.
+func isVarRef(s string) bool {
+	return len(s) > 1 && s[0] == '$' && isNameRef(s[1:])
 }
 
 // resolveAll recursively walks the name tree, triggering file loads
@@ -691,6 +833,71 @@ func (ctx *renderContext) tagForName(name string) (string, *formatDef) {
 	return "", fd
 }
 
+// paramsWithVars renders format params as an HTML attribute string. $varname
+// tokens are substituted first from the entry vars (as with formatParamsWithVars)
+// and then from named definitions whose value is plain text, so a format can
+// carry runtime values into attributes — e.g. value: $authnext on the login
+// page's hidden input. Attributes still containing unresolved $vars are
+// omitted, which doubles as a way to make an attribute conditional: seed the
+// definition only when the attribute should appear.
+func (ctx *renderContext) paramsWithVars(params *OrderedMap, vars map[string]string) string {
+	if params == nil || params.Len() == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	params.Range(func(k string, v interface{}) bool {
+		// Skip attributes whose name isn't a safe HTML token — the name is
+		// emitted unescaped, so a malformed one could break out of the tag.
+		if !isValidAttrName(k) {
+			return true
+		}
+		rendered := substituteVarTokens(fmt.Sprintf("%v", v), func(name string) (string, bool) {
+			if vars != nil {
+				if val, ok := vars[name]; ok {
+					return val, true
+				}
+			}
+			return ctx.defTextValue(name)
+		})
+		// Skip attributes that still contain unreplaced $vars
+		if strings.Contains(rendered, "$") {
+			return true
+		}
+		fmt.Fprintf(&sb, " %s=\"%s\"", k, html.EscapeString(rendered))
+		return true
+	})
+	return sb.String()
+}
+
+// defTextValue returns the plain-text value of a named definition, for $var
+// substitution into attribute values. Only string-valued definitions qualify;
+// structural content (maps, lists) cannot become an attribute value.
+func (ctx *renderContext) defTextValue(name string) (string, bool) {
+	switch v := ctx.defs[name].(type) {
+	case string:
+		return v, true
+	case rawHTML:
+		return string(v), true
+	}
+	return "", false
+}
+
+// iterableContent reports whether content is something renderIterated can
+// consume: a map (one tag per entry) or a list of maps (one tag per item).
+func iterableContent(content interface{}) bool {
+	switch v := content.(type) {
+	case *OrderedMap:
+		return true
+	case []interface{}:
+		if len(v) == 0 {
+			return false
+		}
+		_, ok := v[0].(*OrderedMap)
+		return ok
+	}
+	return false
+}
+
 // renderName resolves a name and renders it.
 func (ctx *renderContext) renderName(sb *strings.Builder, name string, depth int) {
 	if depth > maxRenderDepth {
@@ -771,7 +978,7 @@ func (ctx *renderContext) renderName(sb *strings.Builder, name string, depth int
 			if tag != "" {
 				attrs := ""
 				if fd.Params != nil {
-					attrs = formatParamsWithVars(fd.Params, nil)
+					attrs = ctx.paramsWithVars(fd.Params, nil)
 				}
 				writeTagWithContent(sb, tag, attrs, converted, depth)
 			} else {
@@ -781,9 +988,13 @@ func (ctx *renderContext) renderName(sb *strings.Builder, name string, depth int
 		}
 	}
 
-	// If we have a format with $key/$value params and no $* contents,
-	// this is an iteration format (like ^meta): render each entry separately.
-	if fd != nil && fd.Tag != "" && hasVarSubstitution(fd) && fd.Contents != "$*" {
+	// If we have a format with $key/$value params, no $* contents, and content
+	// that iteration can actually consume (a map, or a list of maps), this is
+	// an iteration format (like ^meta): render each entry separately. Other
+	// content (nil, plain strings) falls through to the normal tag path, where
+	// the format's $var params resolve from named definitions instead — e.g.
+	// the login page's hidden input with value: $authnext and no content.
+	if fd != nil && fd.Tag != "" && hasVarSubstitution(fd) && fd.Contents != "$*" && iterableContent(content) {
 		if found {
 			ctx.resolving[name] = true
 			ctx.renderIterated(sb, name, fd, content, depth)
@@ -796,7 +1007,7 @@ func (ctx *renderContext) renderName(sb *strings.Builder, name string, depth int
 	if tag != "" {
 		attrs := ""
 		if fd != nil && fd.Params != nil {
-			attrs = formatParamsWithVars(fd.Params, nil)
+			attrs = ctx.paramsWithVars(fd.Params, nil)
 		}
 		if found {
 			ctx.resolving[name] = true
@@ -1009,7 +1220,7 @@ func (ctx *renderContext) renderInlineTag(sb *strings.Builder, name, tag string,
 			if tag != "" {
 				attrs := ""
 				if fd.Params != nil {
-					attrs = formatParamsWithVars(fd.Params, nil)
+					attrs = ctx.paramsWithVars(fd.Params, nil)
 				}
 				writeTagWithContent(sb, tag, attrs, converted, depth)
 			} else {
@@ -1045,7 +1256,7 @@ func (ctx *renderContext) renderInlineTag(sb *strings.Builder, name, tag string,
 		// Map it to $* and also to all named $vars in params and contents (e.g., $url, $contents).
 		if str, ok := content.(string); ok {
 			vars := buildVarsFromString(fd, str)
-			attrs := formatParamsWithVars(fd.Params, vars)
+			attrs := ctx.paramsWithVars(fd.Params, vars)
 			contentsVal := substituteVars(fd.Contents, vars)
 			if voidElements[tag] {
 				fmt.Fprintf(sb, "%s<%s%s>\n", indent(depth), tag, attrs)
@@ -1077,7 +1288,7 @@ func (ctx *renderContext) renderInlineTag(sb *strings.Builder, name, tag string,
 
 	attrs := ""
 	if fd != nil && fd.Params != nil {
-		attrs = formatParamsWithVars(fd.Params, nil)
+		attrs = ctx.paramsWithVars(fd.Params, nil)
 	}
 
 	if content == nil {
@@ -1161,7 +1372,7 @@ func (ctx *renderContext) renderInlineTag(sb *strings.Builder, name, tag string,
 
 	// Otherwise render children recursively
 	// For list-type tags (ul, ol), auto-wrap list items in <li>
-	if (tag == "ul" || tag == "ol") {
+	if tag == "ul" || tag == "ol" {
 		if items, ok := content.([]interface{}); ok {
 			fmt.Fprintf(sb, "%s<%s%s>\n", indent(depth), tag, attrs)
 			for _, item := range items {
@@ -1191,7 +1402,7 @@ func (ctx *renderContext) renderInlineTag(sb *strings.Builder, name, tag string,
 		var pieces []string
 		allSingleLine := true
 		for _, item := range items {
-			if str, ok := item.(string); ok && !isNameRef(str) {
+			if str, ok := item.(string); ok && !isNameRef(str) && !isVarRef(str) {
 				pieces = append(pieces, html.EscapeString(str))
 			} else {
 				var buf strings.Builder
@@ -1277,7 +1488,7 @@ func (ctx *renderContext) renderIterated(sb *strings.Builder, name string, fd *f
 		contentMap.Range(func(key string, value interface{}) bool {
 			valStr := fmt.Sprintf("%v", value)
 			vars := map[string]string{"key": key, "value": valStr}
-			attrs := formatParamsWithVars(fd.Params, vars)
+			attrs := ctx.paramsWithVars(fd.Params, vars)
 
 			if ctx.debug {
 				fmt.Fprintf(sb, "<!-- ^%s iterate: key=%q value=%q -->\n", name, key, valStr)
@@ -1308,7 +1519,7 @@ func (ctx *renderContext) renderFormattedEntry(sb *strings.Builder, name string,
 		return true
 	})
 
-	attrs := formatParamsWithVars(fd.Params, vars)
+	attrs := ctx.paramsWithVars(fd.Params, vars)
 	contentsVal := substituteVars(fd.Contents, vars)
 
 	if ctx.debug {
@@ -1467,4 +1678,3 @@ func computeRequestURI(docRoot, reqPath string) string {
 	}
 	return "/" + rel
 }
-

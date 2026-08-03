@@ -32,14 +32,21 @@ type siteSettings struct {
 	ProxyAllowPrivate bool          // allow ProxyBackend to be a loopback/private/link-local address
 	RawYAML           []string      // site-relative .yaml files served raw (text/yaml) instead of rendered as pages
 	AllowIPs          []*net.IPNet  // client IP allowlist (IPs/CIDRs); empty = allow all
-	AuthEmail         string        // passwordless auth recipient; when set, the vhost is gated behind an emailed login code (empty = no auth gate)
-	AuthSMTP          string        // SMTP relay host:port used to send login codes (default b.stg.net:25)
+	AuthEmail         string        // passwordless auth owner/recipient; when set, the vhost is gated behind an emailed login code (empty = no auth gate)
+	AuthSMTP          string        // SMTP relay host:port used to send login codes (default localhost:25)
 	AuthFrom          string        // From/envelope sender for login-code mail (default = AuthEmail)
-	AuthSecret        []byte        // HMAC key that signs bs_auth cookies, loaded from auth-secret-file
+	AuthSecret        []byte        // HMAC key that signs bs_auth cookies, loaded from AuthSecretFile
+	AuthSecretFile    string        // path the HMAC key is loaded from (created if absent)
 	AuthPublic        []string      // extra always-public path prefixes, beyond the built-in splash/asset set
 	AuthTTL           time.Duration // bs_auth cookie lifetime (default 7 days)
-	AuthUsersFile     string        // file of additional approved addresses, one per line (empty = only AuthEmail may sign in)
+	AuthUsers         []string      // additional approved addresses listed inline in _auth.yaml
+	AuthUsersFile     string        // file of additional approved addresses, one per line
+	AuthAllowScript   string        // _auth.yaml allow: hook — shell script deciding whether an address may sign in (e.g. a database check)
+	AuthSendScript    string        // _auth.yaml send: hook — shell script that delivers the one-time code (replaces built-in SMTP)
+	AuthMailSubject   string        // subject for login-code mail (default "Your login code")
+	AuthMailBody      string        // body template for login-code mail; $code is replaced with the code
 	ProxyPathUsers    string        // file of addresses allowed to reach ProxyPath (empty = any signed-in user)
+	SiteRoot          string        // vhost document root, set by vhostSettings (used to find templates and run hooks)
 }
 
 // loadConfigMap loads a _config.yaml file and returns its contents as a map.
@@ -247,17 +254,13 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 			log.Printf("Warning: allow-ip-file %q unreadable: %v", v, err)
 		}
 	}
-	// Passwordless auth gate. When auth-email is set, the vhost is reachable
-	// from any IP but every path outside the always-public set (splash, /auth/*,
-	// assets) requires a valid bs_auth cookie, obtained via a one-time code
-	// mailed to auth-email. See auth.go. Enabling requires a signing secret; if
-	// auth-secret-file is missing it is generated (0600) and persisted so the
-	// 7-day cookies survive restarts.
+	// Passwordless auth gate, legacy keys. The preferred home for auth settings
+	// is the vhost's _auth.yaml (see applyAuthFile), but the original auth-*
+	// keys in _config.yaml keep working; _auth.yaml values override them.
+	// Defaults and the signing secret are applied by finalizeAuthSettings once
+	// both sources have been read.
 	if v, ok := configString(m, "auth-email", ""); ok && v != "" {
 		s.AuthEmail = v
-		s.AuthSMTP = "b.stg.net:25"
-		s.AuthFrom = v
-		s.AuthTTL = 7 * 24 * time.Hour
 		if sv, ok := configString(m, "auth-smtp", ""); ok && sv != "" {
 			s.AuthSMTP = sv
 		}
@@ -270,27 +273,120 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 		if pv, ok := configIndex(m, "auth-public"); ok {
 			s.AuthPublic = normalizePathPatterns(pv)
 		}
-		// Multi-user sign-in. auth-email is the owner address and can always
-		// sign in (so a mistake in the users file can never lock the site out);
-		// auth-users-file names a file of additional approved addresses, one per
-		// line, which the site's own app maintains. Removing an address from it
-		// revokes access on the next request even if that person still holds an
-		// unexpired cookie — this is how a ban takes effect immediately.
 		if uv, ok := configString(m, "auth-users-file", ""); ok && uv != "" {
 			s.AuthUsersFile = uv
 		}
-		secretFile, _ := configString(m, "auth-secret-file", "")
-		if secretFile == "" {
-			log.Printf("Warning: auth-email set but auth-secret-file missing — auth gate disabled for this vhost")
-			s.AuthEmail = ""
-		} else if secret, err := loadOrCreateSecret(secretFile); err != nil {
-			log.Printf("Warning: auth-secret-file %q unusable: %v — auth gate disabled for this vhost", secretFile, err)
-			s.AuthEmail = ""
-		} else {
-			s.AuthSecret = secret
+		if sf, ok := configString(m, "auth-secret-file", ""); ok && sf != "" {
+			s.AuthSecretFile = sf
 		}
 	}
 	return s
+}
+
+// applyAuthFile applies a vhost's _auth.yaml, the one file that controls the
+// passwordless auth gate. The underscore prefix means it can never be served
+// as web content, like _config.yaml. When the vhost is gated, everything
+// outside the always-public set (splash, /auth/*, assets) requires a valid
+// bs_auth cookie, obtained via a one-time code delivered to an approved
+// address. See auth.go.
+//
+// Keys (all optional; values here override _config.yaml's legacy auth-* keys):
+//
+//	email:        owner address; setting it enables the gate, and it can always sign in
+//	secret-file:  path for the HMAC cookie-signing key (created 0600 if absent); required to enable
+//	smtp:         relay host:port for the built-in mailer (default localhost:25)
+//	from:         From/envelope sender for code mail (default = email)
+//	ttl-days:     signed-in cookie lifetime in days (default 7)
+//	public:       extra always-public path prefixes
+//	users:        inline list of additional approved addresses
+//	users-file:   file of additional approved addresses, one per line
+//	mail-subject: subject line for the code mail
+//	mail-body:    body template for the code mail; $code is replaced with the code
+//	send:         shell script that delivers the code instead of the built-in
+//	              mailer; runs with AUTH_EMAIL, AUTH_CODE, AUTH_FROM in the
+//	              environment and the docroot as working directory
+//	allow:        shell script deciding whether an address may sign in (e.g. a
+//	              database lookup); runs with AUTH_EMAIL set, exit 0 = allowed
+//	login:        page definitions for the sign-in dialog, overriding
+//	              auth-login.yaml (read by the renderer, not here)
+//
+// Multi-user note: email is the owner and can always sign in, so a mistake in
+// users/users-file/allow can never lock the site out. Removing an address (or
+// the allow script starting to refuse it) revokes access on the next request
+// — within a minute for allow-script verdicts, which are briefly cached —
+// even if that person still holds an unexpired cookie.
+func applyAuthFile(path string, s *siteSettings) {
+	m := loadConfigMap(path)
+	if m == nil {
+		return
+	}
+	if v, ok := configString(m, "email", ""); ok && v != "" {
+		s.AuthEmail = v
+	}
+	if v, ok := configString(m, "smtp", ""); ok && v != "" {
+		s.AuthSMTP = v
+	}
+	if v, ok := configString(m, "from", ""); ok && v != "" {
+		s.AuthFrom = v
+	}
+	if v, ok := configInt(m, "ttl-days", 0); ok && v > 0 {
+		s.AuthTTL = time.Duration(v) * 24 * time.Hour
+	}
+	if v, ok := configIndex(m, "public"); ok {
+		s.AuthPublic = normalizePathPatterns(v)
+	}
+	if v, ok := configString(m, "secret-file", ""); ok && v != "" {
+		s.AuthSecretFile = v
+	}
+	if v, ok := configIndex(m, "users"); ok {
+		s.AuthUsers = v
+	}
+	if v, ok := configString(m, "users-file", ""); ok && v != "" {
+		s.AuthUsersFile = v
+	}
+	if v, ok := configString(m, "mail-subject", ""); ok && v != "" {
+		s.AuthMailSubject = v
+	}
+	if v, ok := configString(m, "mail-body", ""); ok && v != "" {
+		s.AuthMailBody = v
+	}
+	if v, ok := configString(m, "send", ""); ok && v != "" {
+		s.AuthSendScript = v
+	}
+	if v, ok := configString(m, "allow", ""); ok && v != "" {
+		s.AuthAllowScript = v
+	}
+}
+
+// finalizeAuthSettings fills auth defaults and loads the signing secret once
+// both config sources (_config.yaml auth-* keys and _auth.yaml) have been
+// applied. Enabling the gate requires a secret file: without one, cookies
+// would be signed with an ephemeral key and every sign-in would be lost on
+// restart, so the gate is disabled loudly instead.
+func finalizeAuthSettings(s *siteSettings) {
+	if s.AuthEmail == "" {
+		return
+	}
+	if s.AuthSMTP == "" {
+		s.AuthSMTP = "localhost:25"
+	}
+	if s.AuthFrom == "" {
+		s.AuthFrom = s.AuthEmail
+	}
+	if s.AuthTTL == 0 {
+		s.AuthTTL = 7 * 24 * time.Hour
+	}
+	if s.AuthSecretFile == "" {
+		log.Printf("Warning: auth enabled but no secret-file configured — auth gate disabled for this vhost")
+		s.AuthEmail = ""
+		return
+	}
+	if secret, err := loadOrCreateSecret(s.AuthSecretFile); err != nil {
+		log.Printf("Warning: auth secret-file %q unusable: %v — auth gate disabled for this vhost", s.AuthSecretFile, err)
+		s.AuthEmail = ""
+	} else {
+		s.AuthSecret = secret
+	}
 }
 
 // parseIPNets converts a list of IP addresses and CIDRs into matchers. A bare
@@ -496,8 +592,9 @@ func isAllowedType(ext string, types []string) bool {
 // --- Per-vhost config caching ---
 
 type vhostConfigEntry struct {
-	settings siteSettings
-	modTime  time.Time // mtime of _config.yaml (zero if file absent)
+	settings    siteSettings
+	modTime     time.Time // mtime of _config.yaml (zero if file absent)
+	authModTime time.Time // mtime of _auth.yaml (zero if file absent)
 }
 
 var vhostConfigCache sync.Map // docRoot -> *vhostConfigEntry
@@ -513,17 +610,21 @@ func vhostConfigCacheSize() int {
 // mtime-based invalidation.
 func vhostSettings(docRoot string, defaults siteSettings) siteSettings {
 	configPath := filepath.Join(docRoot, "_config.yaml")
+	authPath := filepath.Join(docRoot, "_auth.yaml")
 
-	// Check file mtime
-	var currentMtime time.Time
+	// Check file mtimes
+	var currentMtime, authMtime time.Time
 	if info, err := os.Stat(configPath); err == nil {
 		currentMtime = info.ModTime()
 	}
+	if info, err := os.Stat(authPath); err == nil {
+		authMtime = info.ModTime()
+	}
 
-	// Return cached if mtime matches
+	// Return cached if mtimes match
 	if cached, ok := vhostConfigCache.Load(docRoot); ok {
 		entry := cached.(*vhostConfigEntry)
-		if entry.modTime.Equal(currentMtime) {
+		if entry.modTime.Equal(currentMtime) && entry.authModTime.Equal(authMtime) {
 			return entry.settings
 		}
 	}
@@ -536,10 +637,16 @@ func vhostSettings(docRoot string, defaults siteSettings) siteSettings {
 		m := loadConfigMap(configPath)
 		settings = applySiteSettings(m, defaults)
 	}
+	settings.SiteRoot = docRoot
+	if !authMtime.IsZero() {
+		applyAuthFile(authPath, &settings)
+	}
+	finalizeAuthSettings(&settings)
 
 	vhostConfigCache.Store(docRoot, &vhostConfigEntry{
-		settings: settings,
-		modTime:  currentMtime,
+		settings:    settings,
+		modTime:     currentMtime,
+		authModTime: authMtime,
 	})
 
 	return settings
