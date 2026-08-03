@@ -388,3 +388,73 @@ func TestCacheControlHeaderOnRenderedPage(t *testing.T) {
 		t.Error("cached response body differs from first response")
 	}
 }
+
+// A vhost with cache-age: 0 must bypass the render cache entirely: nothing
+// stored, nothing served from it, and responses marked no-store so browsers
+// and proxies don't cache either.
+func TestCacheDisabledPerVhost(t *testing.T) {
+	base, _ := os.Getwd()
+	cache := newRenderCache(1<<20, 5*time.Minute)
+	defer cache.Close()
+
+	// vhostConfigCache is global and keyed by docRoot; evict any entry
+	// another test computed with different defaults (and clean up after
+	// ourselves for the same reason).
+	docRoot := filepath.Join(base, "www", "default")
+	vhostConfigCache.Delete(docRoot)
+	defer vhostConfigCache.Delete(docRoot)
+
+	mux := &virtualHostMux{
+		cfg: &config{
+			Base:  filepath.Join(base, "www"),
+			Cache: cache,
+			Site: siteSettings{
+				Index:        []string{"index.yaml", "index.md"},
+				ParentLevels: 1,
+				CacheAge:     0, // cache-age: 0 — caching disabled for this site
+				StaticAge:    24 * time.Hour,
+			},
+		},
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "default"
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i, resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("request %d: Cache-Control = %q, want no-store", i, cc)
+		}
+	}
+
+	if entries, _ := cache.Stats(); entries != 0 {
+		t.Errorf("render cache has %d entries, want 0 (caching disabled)", entries)
+	}
+}
+
+// cache-age: 0 in a config map must produce CacheAge 0 (caching off), not
+// fall back to the server-wide default.
+func TestApplySiteSettingsCacheAgeZero(t *testing.T) {
+	defaults := siteSettings{CacheAge: 15 * time.Minute}
+	s := applySiteSettings(map[string]interface{}{"cache-age": 0}, defaults)
+	if s.CacheAge != 0 {
+		t.Errorf("CacheAge = %v, want 0", s.CacheAge)
+	}
+	if s.cacheEnabled() {
+		t.Error("cacheEnabled() = true, want false for cache-age: 0")
+	}
+
+	// Absent key keeps the default (and caching stays enabled).
+	s = applySiteSettings(map[string]interface{}{}, defaults)
+	if s.CacheAge != 15*time.Minute {
+		t.Errorf("CacheAge = %v, want default 15m", s.CacheAge)
+	}
+	if !s.cacheEnabled() {
+		t.Error("cacheEnabled() = false, want true for default settings")
+	}
+}

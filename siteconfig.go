@@ -49,6 +49,14 @@ type siteSettings struct {
 	SiteRoot          string        // vhost document root, set by vhostSettings (used to find templates and run hooks)
 }
 
+// cacheEnabled reports whether rendered pages for this site may be served
+// from (and stored in) the render cache. A vhost disables caching entirely
+// by setting cache-age: 0 in its _config.yaml; its pages are then rendered
+// fresh on every request and sent with Cache-Control: no-store.
+func (s siteSettings) cacheEnabled() bool {
+	return s.CacheAge > 0
+}
+
 // loadConfigMap loads a _config.yaml file and returns its contents as a map.
 // Returns nil if the file does not exist or cannot be parsed.
 func loadConfigMap(path string) map[string]interface{} {

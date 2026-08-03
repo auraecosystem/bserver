@@ -72,6 +72,9 @@
 
 # Render cache and Cache-Control max-age for rendered pages, in seconds.
 # Browsers and proxies reuse the page without re-requesting for this duration.
+# Set to 0 to disable caching for the site: pages are re-rendered on every
+# request and served with Cache-Control: no-store. In a per-vhost
+# _config.yaml this turns off caching for that vhost only.
 # Default: 900 (15 minutes)
 #cache-age: 900
 
