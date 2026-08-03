@@ -39,8 +39,10 @@ const (
 	authCookieName  = "bs_auth"
 	authCodeTTL     = 10 * time.Minute
 	authCodeMaxTry  = 5                // wrong-code guesses before a code is burned
-	authSendMinGap  = 30 * time.Second // minimum spacing between code emails
-	authSendPerHour = 5                // max code emails per hour
+	authSendMinGap  = 30 * time.Second // minimum spacing between code emails, per address
+	authSendPerHour = 5                // max code emails per hour, per address
+	authSendGlobal  = 60               // max code emails per hour across all addresses
+	authCodesMax    = 500              // hard ceiling on tracked in-flight codes
 	authDialTimeout = 20 * time.Second
 	authSMTPDeadln  = 60 * time.Second // overall deadline once connected (covers greet-pause)
 )
@@ -75,6 +77,112 @@ func loadOrCreateSecret(path string) ([]byte, error) {
 	return []byte(enc), nil
 }
 
+// authUserKey is the request-context key under which the signed-in address is
+// stashed by the gate in ServeHTTP. Its own unexported type keeps it from
+// colliding with any other package's context keys.
+type authUserKey struct{}
+
+// authUserFrom returns the signed-in address for a request, or "" when the
+// request did not carry a valid session (public paths, or auth not configured).
+func authUserFrom(r *http.Request) string {
+	if v, ok := r.Context().Value(authUserKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// --- Approved users --------------------------------------------------------
+
+// The set of addresses allowed to sign in is auth-email plus the contents of
+// auth-users-file, a plain list maintained by the site's own app (one address
+// per line; blank lines and #-comments ignored). It is re-read whenever the
+// file's mtime or size changes, so approving or banning someone takes effect on
+// the next request without a restart — including for people who already hold an
+// unexpired cookie, because validAuthCookie re-checks membership every time.
+var (
+	authUsersMu    sync.Mutex
+	authUsersCache = map[string]*authUsersEntry{} // file path -> parsed contents
+)
+
+type authUsersEntry struct {
+	modTime time.Time
+	size    int64
+	emails  map[string]bool
+}
+
+// loadAuthUsers returns the approved-address set from path, using the cached
+// copy when the file is unchanged. A missing or unreadable file yields an empty
+// set — never an error — so a deleted file degrades to "only auth-email may
+// sign in" rather than opening the vhost up.
+func loadAuthUsers(path string) map[string]bool {
+	if path == "" {
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	authUsersMu.Lock()
+	defer authUsersMu.Unlock()
+	if e, ok := authUsersCache[path]; ok && e.modTime.Equal(fi.ModTime()) && e.size == fi.Size() {
+		return e.emails
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	emails := map[string]bool{}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		emails[normalizeEmail(line)] = true
+	}
+	authUsersCache[path] = &authUsersEntry{modTime: fi.ModTime(), size: fi.Size(), emails: emails}
+	return emails
+}
+
+// normalizeEmail lowercases and trims an address so that comparisons, the code
+// store and the users file all agree on one spelling. Addresses are treated
+// case-insensitively in full; the local part is technically case-sensitive per
+// RFC 5321, but no real mail provider honours that and matching case-sensitively
+// would let "Crystal@..." and "crystal@..." become two accounts.
+func normalizeEmail(addr string) string {
+	return strings.ToLower(strings.TrimSpace(addr))
+}
+
+// authAllowed reports whether addr may request a code and hold a valid session.
+func authAllowed(s siteSettings, addr string) bool {
+	addr = normalizeEmail(addr)
+	if addr == "" {
+		return false
+	}
+	if addr == normalizeEmail(s.AuthEmail) {
+		return true // owner address: always permitted, so the site can't be locked out
+	}
+	return loadAuthUsers(s.AuthUsersFile)[addr]
+}
+
+// plausibleEmail is a deliberately loose syntax check — enough to reject junk
+// and header-injection attempts before an address reaches the mailer, without
+// trying to out-guess RFC 5322 about what a real address may contain.
+func plausibleEmail(addr string) bool {
+	if len(addr) < 3 || len(addr) > 254 {
+		return false
+	}
+	for i := 0; i < len(addr); i++ {
+		if addr[i] < 0x20 || addr[i] == 0x7f || addr[i] == ' ' {
+			return false // control bytes / spaces: SMTP header-injection hygiene
+		}
+	}
+	at := strings.LastIndexByte(addr, '@')
+	if at <= 0 || at == len(addr)-1 {
+		return false
+	}
+	return strings.Contains(addr[at+1:], ".")
+}
+
 // --- Signed cookie token ---------------------------------------------------
 
 // makeAuthToken builds "payload.signature", where payload is a base64url copy of
@@ -91,52 +199,62 @@ func authSign(secret []byte, payload string) string {
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 }
 
-// validAuthToken reports whether token is a well-formed, correctly-signed,
-// unexpired cookie whose embedded address matches wantEmail. The signature is
-// checked in constant time; only if it holds is the payload trusted.
-func validAuthToken(secret []byte, wantEmail, token string, now time.Time) bool {
+// parseAuthToken returns the address carried by a well-formed, correctly-signed,
+// unexpired token. The signature is checked in constant time; only if it holds
+// is the payload trusted. Whether that address is still permitted to sign in is
+// a separate question, answered by authAllowed — the signature only proves the
+// token was minted by us and not tampered with.
+func parseAuthToken(secret []byte, token string, now time.Time) (string, bool) {
 	dot := strings.IndexByte(token, '.')
 	if dot < 0 {
-		return false
+		return "", false
 	}
 	payload, sig := token[:dot], token[dot+1:]
 	if subtle.ConstantTimeCompare([]byte(sig), []byte(authSign(secret, payload))) != 1 {
-		return false
+		return "", false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
-		return false
+		return "", false
 	}
 	bar := strings.LastIndexByte(string(raw), '|')
 	if bar < 0 {
-		return false
+		return "", false
 	}
 	email, expStr := string(raw[:bar]), string(raw[bar+1:])
 	exp, err := strconv.ParseInt(expStr, 10, 64)
 	if err != nil || now.Unix() >= exp {
-		return false
+		return "", false
 	}
-	return subtle.ConstantTimeCompare([]byte(email), []byte(wantEmail)) == 1
+	return email, true
 }
 
-// validAuthCookie reports whether the request carries a valid bs_auth cookie.
-// All cookies of that name are checked, not just the first, to tolerate a stale
-// duplicate (see anyCookieMatches for the same reasoning).
-func validAuthCookie(r *http.Request, s siteSettings) bool {
+// validAuthCookie returns the signed-in address if the request carries a valid
+// bs_auth cookie for an address that is still approved. All cookies of that name
+// are checked, not just the first, to tolerate a stale duplicate (see
+// anyCookieMatches for the same reasoning).
+//
+// Membership is re-checked on every request rather than trusted from the token,
+// so revoking someone takes effect immediately instead of waiting out their
+// cookie's remaining lifetime.
+func validAuthCookie(r *http.Request, s siteSettings) (string, bool) {
 	now := time.Now()
 	for _, c := range r.Cookies() {
-		if c.Name == authCookieName && validAuthToken(s.AuthSecret, s.AuthEmail, c.Value, now) {
-			return true
+		if c.Name != authCookieName {
+			continue
+		}
+		if email, ok := parseAuthToken(s.AuthSecret, c.Value, now); ok && authAllowed(s, email) {
+			return normalizeEmail(email), true
 		}
 	}
-	return false
+	return "", false
 }
 
-func setAuthCookie(w http.ResponseWriter, s siteSettings) {
+func setAuthCookie(w http.ResponseWriter, s siteSettings, email string) {
 	expiry := time.Now().Add(s.AuthTTL)
 	http.SetCookie(w, &http.Cookie{
 		Name:     authCookieName,
-		Value:    makeAuthToken(s.AuthSecret, s.AuthEmail, expiry),
+		Value:    makeAuthToken(s.AuthSecret, normalizeEmail(email), expiry),
 		Path:     "/",
 		Expires:  expiry,
 		MaxAge:   int(s.AuthTTL.Seconds()),
@@ -211,7 +329,13 @@ type authCodeEntry struct {
 // /auth/verify requests must serialize on the same lock.
 var (
 	authCodesMu sync.Mutex
-	authCodes   = map[string]*authCodeEntry{} // email -> entry (one recipient per site, but keying by email keeps it general)
+	authCodes   = map[string]*authCodeEntry{} // email -> entry
+	// Sends across all addresses in the trailing hour. The per-address limits
+	// below cannot bound abuse on a site that accepts more than one recipient:
+	// whoever asks simply rotates addresses. This cap is what actually stops
+	// the endpoint being used to relay mail to addresses of an attacker's
+	// choosing, and it is why authSend refuses unapproved addresses outright.
+	authSendGlobalLog []time.Time
 )
 
 func deleteAuthCode(email string) {
@@ -243,8 +367,34 @@ func issueCode(email string) (string, error) {
 	now := time.Now()
 	authCodesMu.Lock()
 	defer authCodesMu.Unlock()
+
+	// Drop entries whose code has expired and whose send log has aged out.
+	// Without this the map only ever shrinks on a successful verify, so a
+	// stream of distinct addresses would grow it without bound.
+	for k, v := range authCodes {
+		if now.After(v.expiry) && (len(v.sentLog) == 0 || now.Sub(v.sentLog[len(v.sentLog)-1]) >= time.Hour) {
+			delete(authCodes, k)
+		}
+	}
+
+	// Global hourly cap, applied before any per-address bookkeeping so that
+	// rotating addresses cannot walk around it.
+	keptGlobal := authSendGlobalLog[:0]
+	for _, t := range authSendGlobalLog {
+		if now.Sub(t) < time.Hour {
+			keptGlobal = append(keptGlobal, t)
+		}
+	}
+	authSendGlobalLog = keptGlobal
+	if len(authSendGlobalLog) >= authSendGlobal {
+		return "", authUserError{"too many codes requested; try again later"}
+	}
+
 	e := authCodes[email]
 	if e == nil {
+		if len(authCodes) >= authCodesMax {
+			return "", authUserError{"too many codes requested; try again later"}
+		}
 		e = &authCodeEntry{}
 		authCodes[email] = e
 	}
@@ -272,6 +422,7 @@ func issueCode(email string) (string, error) {
 	e.expiry = now.Add(authCodeTTL)
 	e.tries = 0
 	e.sentLog = append(e.sentLog, now)
+	authSendGlobalLog = append(authSendGlobalLog, now)
 	return code, nil
 }
 
@@ -303,8 +454,8 @@ func checkCode(email, code string) bool {
 // It dials with a timeout and sets an overall deadline so a slow/greylisting
 // relay (a deliberately delayed 220 banner is common) cannot hang the sender.
 // No SMTP auth or STARTTLS is attempted — this targets a trusted internal relay.
-func sendLoginCode(s siteSettings) error {
-	code, err := issueCode(s.AuthEmail)
+func sendLoginCode(s siteSettings, to string) error {
+	code, err := issueCode(to)
 	if err != nil {
 		return err
 	}
@@ -326,7 +477,7 @@ func sendLoginCode(s siteSettings) error {
 	_, _ = rand.Read(idbuf[:])
 	msgID := "<" + base64.RawURLEncoding.EncodeToString(idbuf[:]) + "@" + domain + ">"
 	body := "From: " + s.AuthFrom + "\r\n" +
-		"To: " + s.AuthEmail + "\r\n" +
+		"To: " + to + "\r\n" +
 		"Subject: Your login code\r\n" +
 		"Date: " + time.Now().Format(time.RFC1123Z) + "\r\n" +
 		"Message-ID: " + msgID + "\r\n" +
@@ -353,7 +504,7 @@ func sendLoginCode(s siteSettings) error {
 	if err := c.Mail(s.AuthFrom); err != nil {
 		return err
 	}
-	if err := c.Rcpt(s.AuthEmail); err != nil {
+	if err := c.Rcpt(to); err != nil {
 		return err
 	}
 	wc, err := c.Data()
@@ -394,10 +545,33 @@ func authSend(w http.ResponseWriter, r *http.Request, s siteSettings) {
 		return
 	}
 	next := safeNext(r.FormValue("next"))
+	email := normalizeEmail(r.FormValue("email"))
+	if email == "" && s.AuthUsersFile == "" {
+		// Single-recipient site: no users file means auth-email is the only
+		// address that could ever be accepted, so don't make the visitor type
+		// it. This keeps the original one-button login for sites that have not
+		// opted into multiple users.
+		email = normalizeEmail(s.AuthEmail)
+	}
+
+	// Refuse to mail anything but an approved address. This is the control that
+	// keeps the endpoint from being used to send attacker-chosen recipients a
+	// message from this host; the rate limits alone cannot do it, since they are
+	// keyed per address. Unapproved and malformed addresses get the same neutral
+	// answer, so this cannot be used to enumerate who has an account.
+	if !plausibleEmail(email) || !authAllowed(s, email) {
+		if plausibleEmail(email) {
+			log.Printf("auth: refused login code for unapproved address %s", maskEmail(email))
+		}
+		authLoginPageFor(w, r, s, email,
+			"If that address has access, a code is on its way. Otherwise, ask the site owner to approve it first.")
+		return
+	}
+
 	// Mail is sent synchronously so we can surface a real failure to the user,
 	// but the SMTP deadline bounds how long that can take.
-	if err := sendLoginCode(s); err != nil {
-		log.Printf("auth: sending login code to %s failed: %v", s.AuthEmail, err)
+	if err := sendLoginCode(s, email); err != nil {
+		log.Printf("auth: sending login code to %s failed: %v", maskEmail(email), err)
 		// Show rate-limit refusals verbatim, but never raw transport errors:
 		// a dial failure would hand any visitor the relay's host/IP.
 		msg := "Could not send the code right now. Please try again later."
@@ -405,10 +579,10 @@ func authSend(w http.ResponseWriter, r *http.Request, s siteSettings) {
 		if errors.As(err, &ue) {
 			msg = ue.msg
 		}
-		authLoginPage(w, r, s, msg)
+		authLoginPageFor(w, r, s, email, msg)
 		return
 	}
-	http.Redirect(w, r, "/auth/login?sent=1&next="+urlQueryEscape(next), http.StatusSeeOther)
+	http.Redirect(w, r, "/auth/login?sent=1&email="+urlQueryEscape(email)+"&next="+urlQueryEscape(next), http.StatusSeeOther)
 }
 
 func authVerify(w http.ResponseWriter, r *http.Request, s siteSettings) {
@@ -417,19 +591,36 @@ func authVerify(w http.ResponseWriter, r *http.Request, s siteSettings) {
 		return
 	}
 	next := safeNext(r.FormValue("next"))
-	if checkCode(s.AuthEmail, r.FormValue("code")) {
-		setAuthCookie(w, s)
+	email := normalizeEmail(r.FormValue("email"))
+	if email == "" && s.AuthUsersFile == "" {
+		email = normalizeEmail(s.AuthEmail) // single-recipient site; see authSend
+	}
+	// Re-check approval here as well as in authSend: a code could have been
+	// issued moments before the address was banned, and that code must not
+	// still buy a session.
+	if authAllowed(s, email) && checkCode(email, r.FormValue("code")) {
+		setAuthCookie(w, s, email)
 		http.Redirect(w, r, next, http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/auth/login?err=1&next="+urlQueryEscape(next), http.StatusSeeOther)
+	http.Redirect(w, r, "/auth/login?err=1&email="+urlQueryEscape(email)+"&next="+urlQueryEscape(next), http.StatusSeeOther)
 }
 
 // authLoginPage renders the self-contained login page. errMsg, when non-empty,
 // is an inline error to show (e.g. a mail failure). Query flags sent=1 / err=1
 // drive the "code sent" and "incorrect code" notices.
 func authLoginPage(w http.ResponseWriter, r *http.Request, s siteSettings, errMsg string) {
+	authLoginPageFor(w, r, s, normalizeEmail(r.URL.Query().Get("email")), errMsg)
+}
+
+// authLoginPageFor renders the login page with the address field pre-filled, so
+// a visitor who has just been mailed a code (or shown an error) does not have to
+// retype it before entering the code.
+func authLoginPageFor(w http.ResponseWriter, r *http.Request, s siteSettings, email, errMsg string) {
 	next := safeNext(r.URL.Query().Get("next"))
+	if v := safeNext(r.FormValue("next")); next == "/" && v != "/" {
+		next = v
+	}
 	sent := r.URL.Query().Get("sent") == "1"
 	if errMsg == "" && r.URL.Query().Get("err") == "1" {
 		errMsg = "That code was incorrect or expired. Request a new one."
@@ -439,10 +630,36 @@ func authLoginPage(w http.ResponseWriter, r *http.Request, s siteSettings, errMs
 	if errMsg != "" {
 		notice = `<p class="msg err">` + html.EscapeString(errMsg) + `</p>`
 	} else if sent {
-		notice = `<p class="msg ok">A login code was sent to ` + html.EscapeString(maskEmail(s.AuthEmail)) + `. Enter it below.</p>`
+		to := "your address"
+		if email != "" {
+			to = maskEmail(email)
+		}
+		notice = `<p class="msg ok">A login code was sent to ` + html.EscapeString(to) + `. Enter it below.</p>`
 	}
 
 	nextEsc := html.EscapeString(next)
+	emailEsc := html.EscapeString(email)
+	// Focus whichever field the visitor is due to fill in next.
+	autofocusEmail, autofocusCode := ` autofocus`, ``
+	if sent {
+		autofocusEmail, autofocusCode = ``, ` autofocus`
+	}
+	// Ask who is signing in only on sites that accept more than one address.
+	// Where auth-email is the only possible recipient, asking for it would be
+	// a pointless extra step — and a change in behaviour for every site that
+	// configured this gate before multi-user support existed.
+	emailField, emailCarry := ``, ``
+	if s.AuthUsersFile != "" {
+		emailField = `<label for="email">Email address</label>
+<input id="email" name="email" type="email" autocomplete="email" spellcheck="false"
+  placeholder="you@example.com" value="` + emailEsc + `"` + autofocusEmail + `>
+`
+		// Carry the address to the verify step so it need not be retyped.
+		emailCarry = `<input type="hidden" name="email" value="` + emailEsc + `">
+`
+	} else {
+		autofocusCode = ` autofocus`
+	}
 	page := `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -481,14 +698,14 @@ label{display:block;font-size:.8rem;color:#666;margin:0 0 .3rem}
 ` + notice + `
 <form method="post" action="/auth/send">
 <input type="hidden" name="next" value="` + nextEsc + `">
-<button type="submit">Email me a login code</button>
+` + emailField + `<button type="submit">Email me a login code</button>
 </form>
 <div class="divider">then enter it</div>
 <form method="post" action="/auth/verify">
 <input type="hidden" name="next" value="` + nextEsc + `">
-<label for="code">6-digit code</label>
+` + emailCarry + `<label for="code">6-digit code</label>
 <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code"
-  pattern="[0-9]*" maxlength="6" placeholder="123456" autofocus>
+  pattern="[0-9]*" maxlength="6" placeholder="123456"` + autofocusCode + `>
 <button type="submit">Sign in</button>
 </form>
 <a class="home" href="/">← Back to home</a>

@@ -325,7 +325,8 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			serveAuth(w, r, site, p)
 			return
 		}
-		if !authPublic(p, site) && !validAuthCookie(r, site) {
+		authUser, signedIn := validAuthCookie(r, site)
+		if !authPublic(p, site) && !signedIn {
 			if r.Method == http.MethodGet || r.Method == http.MethodHead {
 				next := r.URL.Path
 				if r.URL.RawQuery != "" {
@@ -336,6 +337,13 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			}
 			return
+		}
+		// Carry the signed-in address down to the CGI layer, which exports it as
+		// REMOTE_USER so a PHP app can tell its users apart. Set only when a
+		// valid cookie was actually presented, so a public page never sees a
+		// stale or spoofed identity.
+		if signedIn {
+			r = r.WithContext(context.WithValue(r.Context(), authUserKey{}, authUser))
 		}
 	}
 
@@ -394,6 +402,17 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			r.Header.Del("Authorization")
+		}
+		// Per-user restriction on the proxied path. The auth gate above has
+		// already established who this is; here we ask whether that person is on
+		// the shorter list allowed to reach the backend. The app cannot enforce
+		// this itself — nothing it serves sits between the visitor and the proxy.
+		if site.ProxyPathUsers != "" {
+			u := authUserFrom(r)
+			if u == "" || !loadAuthUsers(site.ProxyPathUsers)[u] {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
 		}
 		if rp := getPathProxy(site.ProxyBackend, site.ProxyAllowPrivate); rp != nil {
 			rp.ServeHTTP(w, r)
@@ -768,6 +787,15 @@ func (m *virtualHostMux) handlePHP(w http.ResponseWriter, r *http.Request, host,
 		"SCRIPT_NAME=" + scriptName,
 		"PATH_INFO=" + pathInfo,
 		"REMOTE_ADDR=" + remoteAddr,
+	}
+
+	// Identity of the signed-in visitor, for apps that support more than one
+	// user. REMOTE_USER is the conventional CGI variable for this and reaches
+	// PHP as $_SERVER['REMOTE_USER']. It is set only when the auth gate verified
+	// a cookie on this request, and — because it is assembled here rather than
+	// copied from a header — a client cannot forge it by sending its own.
+	if u := authUserFrom(r); u != "" {
+		env = append(env, "REMOTE_USER="+u)
 	}
 
 	// Forward HTTP request headers as HTTP_* env vars.

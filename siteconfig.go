@@ -38,6 +38,8 @@ type siteSettings struct {
 	AuthSecret        []byte        // HMAC key that signs bs_auth cookies, loaded from auth-secret-file
 	AuthPublic        []string      // extra always-public path prefixes, beyond the built-in splash/asset set
 	AuthTTL           time.Duration // bs_auth cookie lifetime (default 7 days)
+	AuthUsersFile     string        // file of additional approved addresses, one per line (empty = only AuthEmail may sign in)
+	ProxyPathUsers    string        // file of addresses allowed to reach ProxyPath (empty = any signed-in user)
 }
 
 // loadConfigMap loads a _config.yaml file and returns its contents as a map.
@@ -215,6 +217,13 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 			log.Printf("Warning: proxy-path-key-file %q unreadable: %v", v, err)
 		}
 	}
+	// Restrict the proxied path to specific signed-in addresses. Needed when a
+	// vhost is shared by several people but the backend is not for all of them —
+	// a web shell, say. A page-level check inside the app cannot do this: the
+	// proxy is served here, before any app code runs.
+	if v, ok := configString(m, "proxy-path-users-file", ""); ok && v != "" {
+		s.ProxyPathUsers = v
+	}
 	if v, ok := configBool(m, "proxy-path-allow-private", false); ok {
 		s.ProxyAllowPrivate = v
 	}
@@ -260,6 +269,15 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 		}
 		if pv, ok := configIndex(m, "auth-public"); ok {
 			s.AuthPublic = normalizePathPatterns(pv)
+		}
+		// Multi-user sign-in. auth-email is the owner address and can always
+		// sign in (so a mistake in the users file can never lock the site out);
+		// auth-users-file names a file of additional approved addresses, one per
+		// line, which the site's own app maintains. Removing an address from it
+		// revokes access on the next request even if that person still holds an
+		// unexpired cookie — this is how a ban takes effect immediately.
+		if uv, ok := configString(m, "auth-users-file", ""); ok && uv != "" {
+			s.AuthUsersFile = uv
 		}
 		secretFile, _ := configString(m, "auth-secret-file", "")
 		if secretFile == "" {
