@@ -111,6 +111,11 @@ proxy mode — composes from these four pieces.
   fallback for IPs and `.local` / `.test` / `.internal`
 - **Reverse proxy mode** — one-line `index.yaml` turns a vhost into a
   proxy (with SSRF guards and optional API-key gating)
+- **Passwordless authentication** — a per-vhost `_auth.yaml` gates the
+  site behind emailed one-time codes, with multi-user approval (inline
+  list, file, or script hook such as a database check), pluggable code
+  delivery, and a sign-in dialog defined entirely in customizable YAML
+  (`auth-login.yaml`), not server code
 - **Render cache** with fsnotify invalidation and RAM-aware sizing
 - **Security headers, rate limiting, privilege dropping**, port-80
   fallback

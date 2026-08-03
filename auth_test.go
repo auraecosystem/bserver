@@ -1,6 +1,11 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,8 +17,12 @@ func TestAuthTokenRoundTrip(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	tok := makeAuthToken(secret, email, now.Add(7*24*time.Hour))
 
-	if !validAuthToken(secret, email, tok, now) {
+	got, ok := parseAuthToken(secret, tok, now)
+	if !ok {
 		t.Fatal("freshly minted token should validate")
+	}
+	if got != email {
+		t.Fatalf("token should carry its address: got %q, want %q", got, email)
 	}
 }
 
@@ -23,10 +32,10 @@ func TestAuthTokenExpiry(t *testing.T) {
 	issued := time.Unix(1_700_000_000, 0)
 	tok := makeAuthToken(secret, email, issued.Add(time.Hour))
 
-	if validAuthToken(secret, email, tok, issued.Add(2*time.Hour)) {
+	if _, ok := parseAuthToken(secret, tok, issued.Add(2*time.Hour)); ok {
 		t.Error("expired token must be rejected")
 	}
-	if !validAuthToken(secret, email, tok, issued.Add(30*time.Minute)) {
+	if _, ok := parseAuthToken(secret, tok, issued.Add(30*time.Minute)); !ok {
 		t.Error("token still within lifetime should validate")
 	}
 }
@@ -38,7 +47,7 @@ func TestAuthTokenTampering(t *testing.T) {
 	tok := makeAuthToken(secret, email, now.Add(time.Hour))
 
 	// Wrong signing key.
-	if validAuthToken([]byte("different-secret-key-000000000000000"), email, tok, now) {
+	if _, ok := parseAuthToken([]byte("different-secret-key-000000000000000"), tok, now); ok {
 		t.Error("token signed with a different secret must be rejected")
 	}
 	// Flipped last byte of the signature.
@@ -48,18 +57,396 @@ func TestAuthTokenTampering(t *testing.T) {
 	} else {
 		bad += "A"
 	}
-	if validAuthToken(secret, email, bad, now) {
+	if _, ok := parseAuthToken(secret, bad, now); ok {
 		t.Error("token with a tampered signature must be rejected")
-	}
-	// Mismatched recipient (e.g. secret shared across vhosts).
-	if validAuthToken(secret, "someone@else.net", tok, now) {
-		t.Error("token whose embedded address differs from the vhost must be rejected")
 	}
 	// Structurally broken tokens.
 	for _, junk := range []string{"", "no-dot", "a.b.c", ".", "payload."} {
-		if validAuthToken(secret, email, junk, now) {
+		if _, ok := parseAuthToken(secret, junk, now); ok {
 			t.Errorf("malformed token %q must be rejected", junk)
 		}
+	}
+}
+
+// A correctly-signed token is not by itself a session: the address it carries
+// must still be approved. This is what makes a ban take effect immediately
+// rather than when the cookie eventually expires, and it also stands in for the
+// address check that used to live inside the token comparison — a token minted
+// for another vhost's user is rejected here unless that address is approved.
+func TestAuthCookieRequiresApproval(t *testing.T) {
+	dir := t.TempDir()
+	usersFile := filepath.Join(dir, "users")
+	if err := os.WriteFile(usersFile, []byte("friend@example.com\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := siteSettings{
+		AuthEmail:     "crystal@stg.net",
+		AuthSecret:    []byte("test-secret-key-01234567890123456789"),
+		AuthUsersFile: usersFile,
+	}
+	expiry := time.Now().Add(time.Hour)
+
+	req := func(email string) *http.Request {
+		r := httptest.NewRequest("GET", "/recipe?list", nil)
+		r.AddCookie(&http.Cookie{Name: authCookieName, Value: makeAuthToken(s.AuthSecret, email, expiry)})
+		return r
+	}
+
+	for _, email := range []string{"crystal@stg.net", "friend@example.com"} {
+		got, ok := validAuthCookie(req(email), s)
+		if !ok {
+			t.Errorf("approved address %q should hold a session", email)
+		}
+		if got != email {
+			t.Errorf("session identity: got %q, want %q", got, email)
+		}
+	}
+	if _, ok := validAuthCookie(req("stranger@example.com"), s); ok {
+		t.Error("address absent from the users file must not hold a session")
+	}
+
+	// Revoking on disk takes effect without a restart, even though the cookie
+	// itself is still perfectly valid and unexpired.
+	if err := os.WriteFile(usersFile, []byte("# friend removed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := validAuthCookie(req("friend@example.com"), s); ok {
+		t.Error("a revoked address must lose its session on the very next request")
+	}
+	// The owner address is never revocable this way, so the site cannot be
+	// locked out by an empty or broken users file.
+	if _, ok := validAuthCookie(req("crystal@stg.net"), s); !ok {
+		t.Error("owner address must keep access regardless of the users file")
+	}
+}
+
+func TestAuthAllowedNormalizesCase(t *testing.T) {
+	dir := t.TempDir()
+	usersFile := filepath.Join(dir, "users")
+	if err := os.WriteFile(usersFile, []byte("  Friend@Example.COM  \n\n# a comment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := siteSettings{AuthEmail: "Crystal@STG.net", AuthUsersFile: usersFile}
+
+	for _, addr := range []string{"friend@example.com", "FRIEND@EXAMPLE.COM", " friend@example.com "} {
+		if !authAllowed(s, addr) {
+			t.Errorf("%q should match the approved address regardless of case/space", addr)
+		}
+	}
+	if !authAllowed(s, "crystal@stg.net") {
+		t.Error("owner address should match case-insensitively too")
+	}
+	if authAllowed(s, "") || authAllowed(s, "# a comment") {
+		t.Error("blank lines and comments must not become approved addresses")
+	}
+}
+
+// A missing users file must fail closed — only the owner may sign in — rather
+// than being read as "no restrictions".
+func TestAuthUsersFileMissingFailsClosed(t *testing.T) {
+	s := siteSettings{AuthEmail: "crystal@stg.net", AuthUsersFile: "/nonexistent/nope"}
+	if !authAllowed(s, "crystal@stg.net") {
+		t.Error("owner must still be allowed when the users file is missing")
+	}
+	if authAllowed(s, "anyone@example.com") {
+		t.Error("a missing users file must not admit anyone")
+	}
+}
+
+// The proxied path (a web shell here) must be reachable only by the addresses
+// listed for it, not by everyone who can sign in. This cannot be enforced by the
+// app, so it is worth pinning down: a signed-in ordinary user gets 403, a listed
+// one gets through.
+func TestProxyPathUsersFile(t *testing.T) {
+	dir := t.TempDir()
+	usersFile := filepath.Join(dir, "users")
+	superFile := filepath.Join(dir, "supers")
+	if err := os.WriteFile(usersFile, []byte("friend@example.com\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(superFile, []byte("crystal@stg.net\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := siteSettings{
+		AuthEmail:      "crystal@stg.net",
+		AuthSecret:     []byte("test-secret-key-01234567890123456789"),
+		AuthUsersFile:  usersFile,
+		ProxyPathUsers: superFile,
+	}
+	// Both are legitimately signed in; only one may reach the backend.
+	if !authAllowed(s, "friend@example.com") {
+		t.Fatal("precondition: friend should be able to sign in at all")
+	}
+	if !loadAuthUsers(s.ProxyPathUsers)["crystal@stg.net"] {
+		t.Error("listed address should be allowed through to the proxy")
+	}
+	if loadAuthUsers(s.ProxyPathUsers)["friend@example.com"] {
+		t.Error("signing in must not by itself grant access to the proxied path")
+	}
+}
+
+// A site that has not opted into multiple users must keep the original
+// one-button login: no address field, and auth-email assumed. Sites with any
+// extra approval source get the field, because there the address is a real
+// choice. The page renders from www/auth-login.yaml — no HTML lives in Go.
+func TestLoginPageAsksForAddressOnlyWhenMultiUser(t *testing.T) {
+	base := siteSettings{
+		AuthEmail:  "owner@example.com",
+		AuthSecret: []byte("test-secret-key-01234567890123456789"),
+		SiteRoot:   "www",
+	}
+	render := func(s siteSettings) string {
+		w := httptest.NewRecorder()
+		authLoginPage(w, httptest.NewRequest("GET", "/auth/login", nil), s, "")
+		return w.Body.String()
+	}
+
+	if strings.Contains(render(base), `name="email"`) {
+		t.Error("single-recipient site must not ask for an address")
+	}
+	multi := base
+	multi.AuthUsersFile = filepath.Join(t.TempDir(), "users")
+	if !strings.Contains(render(multi), `name="email"`) {
+		t.Error("multi-user site must ask which address is signing in")
+	}
+}
+
+// The login dialog is site content, not server code: it renders from
+// auth-login.yaml through the YAML pipeline, and the runtime facts reach it as
+// pre-seeded $auth definitions — including inside format params.
+func TestRenderAuthLoginPage(t *testing.T) {
+	page := renderAuthLoginPage("www", authLoginState{
+		Next:      "/private/recipes?p=2",
+		Email:     "someone@example.com",
+		Notice:    "That code was incorrect or expired. Request a new one.",
+		NoticeErr: true,
+		MultiUser: true,
+	}, 0, nil)
+	if page == "" {
+		t.Fatal("default www/auth-login.yaml should render")
+	}
+	for _, want := range []string{
+		`action="/auth/send"`,
+		`action="/auth/verify"`,
+		`name="next" value="/private/recipes?p=2"`, // $authnext resolved inside params
+		`name="email"`,
+		`value="someone@example.com"`,
+		"That code was incorrect or expired",
+		`class="auth-msg err"`, // $authnoticeclass resolved inside params
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("login page missing %q\npage:\n%s", want, page)
+		}
+	}
+	// Before a code is sent, focus belongs on the (multi-user) address field
+	// and nowhere else; $authfocuscode stays unseeded so the attribute is
+	// dropped from the code input entirely.
+	if !strings.Contains(page, `id="email"`) || strings.Count(page, `autofocus=`) != 1 {
+		t.Errorf("exactly one field should carry autofocus, page:\n%s", page)
+	}
+
+	// Single-user page: no address input of any kind, and no notice block
+	// (the .auth-msg CSS rule is always present; the rendered <p> is not).
+	single := renderAuthLoginPage("www", authLoginState{Next: "/"}, 0, nil)
+	if strings.Contains(single, `name="email"`) {
+		t.Error("single-user page must not contain an email input")
+	}
+	if strings.Contains(single, `class="auth-msg`) {
+		t.Error("page without a notice must not render the notice block")
+	}
+}
+
+// A missing template is a broken install and answers plain text — the server
+// itself contains no fallback HTML.
+func TestLoginPageWithoutTemplate(t *testing.T) {
+	s := siteSettings{
+		AuthEmail:  "owner@example.com",
+		AuthSecret: []byte("test-secret-key-01234567890123456789"),
+		SiteRoot:   t.TempDir(), // no auth-login.yaml anywhere in reach
+	}
+	w := httptest.NewRecorder()
+	authLoginPage(w, httptest.NewRequest("GET", "/auth/login", nil), s, "")
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 without a template, got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); strings.Contains(ct, "text/html") {
+		t.Errorf("no-template response must not claim to be HTML, got %q", ct)
+	}
+}
+
+// _auth.yaml is the one-stop control file: settings, inline users, mail text.
+func TestAuthFileSettings(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "secret")
+	authYAML := "email: owner@example.com\n" +
+		"secret-file: " + secret + "\n" +
+		"users:\n  - Friend@Example.com\n" +
+		"mail-subject: Your Example code\n" +
+		"mail-body: 'Code: $code'\n" +
+		"ttl-days: 3\n"
+	if err := os.WriteFile(filepath.Join(dir, "_auth.yaml"), []byte(authYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := vhostSettings(dir, siteSettings{})
+	if s.AuthEmail != "owner@example.com" {
+		t.Fatalf("email from _auth.yaml should enable the gate, got %q", s.AuthEmail)
+	}
+	if s.SiteRoot != dir {
+		t.Errorf("SiteRoot should be the docroot, got %q", s.SiteRoot)
+	}
+	if len(s.AuthSecret) == 0 {
+		t.Error("secret should have been created and loaded")
+	}
+	if s.AuthSMTP != "localhost:25" {
+		t.Errorf("default smtp should be localhost:25, got %q", s.AuthSMTP)
+	}
+	if s.AuthTTL != 3*24*time.Hour {
+		t.Errorf("ttl-days should apply, got %v", s.AuthTTL)
+	}
+	if s.AuthMailSubject != "Your Example code" || s.AuthMailBody != "Code: $code" {
+		t.Errorf("mail text should apply, got %q / %q", s.AuthMailSubject, s.AuthMailBody)
+	}
+	if !s.authMultiUser() {
+		t.Error("inline users list should make the site multi-user")
+	}
+	if !authAllowed(s, "friend@example.com") {
+		t.Error("inline users entry should be approved (case-insensitively)")
+	}
+	if authAllowed(s, "stranger@example.com") {
+		t.Error("unlisted address must not be approved")
+	}
+}
+
+// The allow: hook delegates approval to a script — standing in for a database
+// or directory lookup. Exit 0 allows; anything else, including a broken
+// script, denies (the owner address never reaches the hook).
+func TestAuthAllowScript(t *testing.T) {
+	s := siteSettings{
+		AuthEmail:       "owner@example.com",
+		SiteRoot:        t.TempDir(),
+		AuthAllowScript: `test "$AUTH_EMAIL" = "db-user@example.com"`,
+	}
+	if !s.authMultiUser() {
+		t.Error("an allow script should make the site multi-user")
+	}
+	if !authAllowed(s, "db-user@example.com") {
+		t.Error("address the script accepts should be approved")
+	}
+	if authAllowed(s, "other@example.com") {
+		t.Error("address the script rejects must not be approved")
+	}
+	if !authAllowed(s, "owner@example.com") {
+		t.Error("owner must be approved without consulting the script")
+	}
+
+	broken := s
+	broken.SiteRoot = t.TempDir() // separate verdict-cache namespace
+	broken.AuthAllowScript = "exit 3"
+	if authAllowed(broken, "db-user@example.com") {
+		t.Error("failing script must deny (fail closed)")
+	}
+}
+
+// The send: hook owns code delivery: it receives the address and the minted
+// code in the environment, and the code it received must actually verify.
+func TestAuthSendScript(t *testing.T) {
+	dir := t.TempDir()
+	s := siteSettings{
+		AuthEmail:      "owner@example.com",
+		AuthFrom:       "noreply@example.com",
+		SiteRoot:       dir,
+		AuthSendScript: `printf '%s %s' "$AUTH_EMAIL" "$AUTH_CODE" > sent`,
+	}
+	deleteAuthCode("owner@example.com")
+	if err := sendLoginCode(s, "owner@example.com"); err != nil {
+		t.Fatalf("send script should succeed: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "sent")) // script cwd is the docroot
+	if err != nil {
+		t.Fatalf("send script should have written its output: %v", err)
+	}
+	parts := strings.Fields(string(b))
+	if len(parts) != 2 || parts[0] != "owner@example.com" {
+		t.Fatalf("script should receive address and code, got %q", b)
+	}
+	if !checkCode("owner@example.com", parts[1]) {
+		t.Error("the code handed to the script should verify")
+	}
+
+	failing := s
+	failing.AuthSendScript = "echo delivery down >&2; exit 1"
+	deleteAuthCode("owner@example.com")
+	if err := sendLoginCode(failing, "owner@example.com"); err == nil {
+		t.Error("failing send script must surface an error")
+	}
+}
+
+// The login: section of _auth.yaml can define the dialog inline, overriding
+// any auth-login.yaml — everything about a site's auth in one file.
+func TestAuthLoginOverlay(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"html.yaml":  "html:\n - body\nbody:\n - main\n",
+		"_auth.yaml": "email: owner@example.com\nlogin:\n  auth-login:\n    - h1: Custom Dialog\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page := renderAuthLoginPage(dir, authLoginState{Next: "/"}, 0, nil)
+	if !strings.Contains(page, "Custom Dialog") {
+		t.Errorf("login: section should supply the dialog, got:\n%s", page)
+	}
+}
+
+func TestPlausibleEmail(t *testing.T) {
+	ok := []string{"a@b.co", "crystal@stg.net", "first.last+tag@sub.example.org"}
+	bad := []string{
+		"", "nope", "@example.com", "user@", "user@localhost",
+		"user@example.com\r\nBcc: victim@example.com", // header injection
+		"user name@example.com",
+		strings.Repeat("x", 250) + "@example.com", // over length
+	}
+	for _, a := range ok {
+		if !plausibleEmail(a) {
+			t.Errorf("%q should be accepted", a)
+		}
+	}
+	for _, a := range bad {
+		if plausibleEmail(a) {
+			t.Errorf("%q should be rejected", a)
+		}
+	}
+}
+
+// The per-address limits cannot bound a site that accepts many addresses, so
+// the global cap is what actually stops the endpoint relaying mail. Rotating
+// addresses must hit it.
+func TestIssueCodeGlobalCap(t *testing.T) {
+	// The code store and the global send log are package-level, so this test
+	// both starts from a clean slate and restores one — otherwise filling the
+	// hourly cap here would starve every later test in the package.
+	authCodesMu.Lock()
+	prevCodes, prevLog := authCodes, authSendGlobalLog
+	authCodes = map[string]*authCodeEntry{}
+	authSendGlobalLog = nil
+	authCodesMu.Unlock()
+	t.Cleanup(func() {
+		authCodesMu.Lock()
+		authCodes, authSendGlobalLog = prevCodes, prevLog
+		authCodesMu.Unlock()
+	})
+
+	sent := 0
+	for i := 0; i < authSendGlobal+10; i++ {
+		if _, err := issueCode(fmt.Sprintf("user%d@example.com", i)); err == nil {
+			sent++
+		}
+	}
+	if sent != authSendGlobal {
+		t.Errorf("global cap: sent %d codes, want exactly %d", sent, authSendGlobal)
 	}
 }
 
@@ -131,5 +518,26 @@ func TestMaskEmail(t *testing.T) {
 		if got := maskEmail(in); got != want {
 			t.Errorf("maskEmail(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// substituteVarTokens must match whole tokens: one name being a prefix of
+// another ($authnotice / $authnoticeclass) can never corrupt the longer one,
+// and unresolved tokens stay in place.
+func TestSubstituteVarTokens(t *testing.T) {
+	resolve := func(name string) (string, bool) {
+		switch name {
+		case "authnotice":
+			return "N", true
+		case "authnoticeclass":
+			return "C", true
+		}
+		return "", false
+	}
+	if got := substituteVarTokens("msg $authnoticeclass and $authnotice", resolve); got != "msg C and N" {
+		t.Errorf("token substitution got %q", got)
+	}
+	if got := substituteVarTokens("keep $unknown intact, $ too", resolve); got != "keep $unknown intact, $ too" {
+		t.Errorf("unresolved tokens should stay put, got %q", got)
 	}
 }

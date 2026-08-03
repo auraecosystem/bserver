@@ -212,6 +212,41 @@ func formatMapAsAttrs(m *OrderedMap) string {
 	return sb.String()
 }
 
+// substituteVarTokens replaces each $varname token in s using resolve, leaving
+// unresolved tokens in place. Unlike substituteVars, tokens are matched by
+// scanning the full name, so one name that is a prefix of another (e.g.
+// $authnotice / $authnoticeclass) can never corrupt the longer token.
+func substituteVarTokens(s string, resolve func(name string) (string, bool)) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '$' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(s) && (s[j] >= 'a' && s[j] <= 'z' || s[j] >= 'A' && s[j] <= 'Z' ||
+			s[j] >= '0' && s[j] <= '9' || s[j] == '_' || s[j] == '*') {
+			j++
+		}
+		if j == i+1 {
+			b.WriteByte('$')
+			i++
+			continue
+		}
+		if v, ok := resolve(s[i+1 : j]); ok {
+			b.WriteString(v)
+		} else {
+			b.WriteString(s[i:j])
+		}
+		i = j
+	}
+	return b.String()
+}
+
 // hasUnreplacedVars returns true if s still contains $varname tokens.
 func hasUnreplacedVars(s string) bool {
 	return strings.Contains(s, "$")
