@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -539,5 +540,45 @@ func TestSubstituteVarTokens(t *testing.T) {
 	}
 	if got := substituteVarTokens("keep $unknown intact, $ too", resolve); got != "keep $unknown intact, $ too" {
 		t.Errorf("unresolved tokens should stay put, got %q", got)
+	}
+}
+
+// The signed-in identity must reach inline YAML scripts the same way it
+// reaches php-cgi: as REMOTE_USER, set from the request context the auth gate
+// populated — never from a client header, which arrives as HTTP_REMOTE_USER.
+func TestScriptEnvRemoteUser(t *testing.T) {
+	newCtx := func(r *http.Request) *renderContext {
+		return &renderContext{
+			docRoot:     t.TempDir(),
+			requestURI:  "/page",
+			httpRequest: r,
+			defs:        make(map[string]interface{}),
+			filesLoaded: make(map[string]bool),
+		}
+	}
+	hasRemoteUser := func(env []string) (string, bool) {
+		for _, e := range env {
+			if v, ok := strings.CutPrefix(e, "REMOTE_USER="); ok {
+				return v, true
+			}
+		}
+		return "", false
+	}
+
+	r := httptest.NewRequest("GET", "/page", nil)
+	r.Header.Set("Remote-User", "spoofed@example.com") // must not become REMOTE_USER
+	if v, ok := hasRemoteUser(newCtx(r).buildScriptEnv("")); ok {
+		t.Errorf("unauthenticated request must not export REMOTE_USER, got %q", v)
+	}
+
+	signed := r.WithContext(context.WithValue(r.Context(), authUserKey{}, "friend@example.com"))
+	env := newCtx(signed).buildScriptEnv("")
+	if v, ok := hasRemoteUser(env); !ok || v != "friend@example.com" {
+		t.Errorf("signed-in request should export REMOTE_USER=friend@example.com, got %q (present=%v)", v, ok)
+	}
+	for _, e := range env {
+		if strings.HasPrefix(e, "HTTP_REMOTE_USER=") && !strings.HasPrefix(e, "HTTP_REMOTE_USER=spoofed") {
+			t.Errorf("unexpected header mangling: %s", e)
+		}
 	}
 }

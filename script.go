@@ -139,6 +139,14 @@ func (ctx *renderContext) buildScriptEnv(scriptFile string) []string {
 		"HTTP_HOST="+r.Host,
 	)
 
+	// Identity of the signed-in visitor (passwordless auth gate), matching what
+	// the php-cgi path exports. Set from the request context — never from a
+	// header, which would arrive as HTTP_REMOTE_USER — so a client cannot forge
+	// it. Empty (absent) on public paths or when the gate is not configured.
+	if u := authUserFrom(r); u != "" {
+		env = append(env, "REMOTE_USER="+u)
+	}
+
 	// Forward HTTP headers as HTTP_* variables. Strip CR/LF/NUL so a
 	// header value cannot expand into multiple env entries or inject
 	// shell statements when interpolated unquoted by a script.
@@ -508,7 +516,7 @@ func shScriptWrapper(userCode string) string {
 func phpScriptWrapper(userCode string) string {
 	var sb strings.Builder
 	// Populate $_SERVER from CGI environment variables
-	sb.WriteString("foreach (['REQUEST_SCHEME','REQUEST_METHOD','REQUEST_URI','QUERY_STRING','CONTENT_TYPE','CONTENT_LENGTH','DOCUMENT_ROOT','SCRIPT_FILENAME','SCRIPT_NAME','PHP_SELF','SERVER_NAME','SERVER_PORT','SERVER_PROTOCOL','SERVER_SOFTWARE','GATEWAY_INTERFACE','REMOTE_ADDR','HTTP_HOST','REDIRECT_STATUS','SERVER_ADDR','PATH_INFO'] as $_k) { $_v = getenv($_k); if ($_v !== false) $_SERVER[$_k] = $_v; }\n")
+	sb.WriteString("foreach (['REQUEST_SCHEME','REQUEST_METHOD','REQUEST_URI','QUERY_STRING','CONTENT_TYPE','CONTENT_LENGTH','DOCUMENT_ROOT','SCRIPT_FILENAME','SCRIPT_NAME','PHP_SELF','SERVER_NAME','SERVER_PORT','SERVER_PROTOCOL','SERVER_SOFTWARE','GATEWAY_INTERFACE','REMOTE_ADDR','HTTP_HOST','REDIRECT_STATUS','SERVER_ADDR','PATH_INFO','REMOTE_USER'] as $_k) { $_v = getenv($_k); if ($_v !== false) $_SERVER[$_k] = $_v; }\n")
 	sb.WriteString("foreach ($_SERVER as $_k => $_v) { if (strpos($_k, 'HTTP_') === 0) $_SERVER[$_k] = $_v; }\n")
 	// Populate $_COOKIE from HTTP_COOKIE env var
 	sb.WriteString("$_COOKIE = []; $_rawCookie = getenv('HTTP_COOKIE'); if ($_rawCookie !== false) { foreach (explode(';', $_rawCookie) as $_c) { $_c = trim($_c); if ($_c === '') continue; $_eq = strpos($_c, '='); if ($_eq !== false) { $_COOKIE[urldecode(substr($_c, 0, $_eq))] = urldecode(substr($_c, $_eq + 1)); } } }\n")
