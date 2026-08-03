@@ -137,11 +137,26 @@ These settings go in `_config.yaml` (in the www directory):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `cache-size` | `1024` | Maximum cache size in MB (0 to disable) |
-| `cache-age` | `900` | Maximum entry age in seconds (15 minutes) |
+| `cache-age` | `900` | Maximum entry age in seconds (15 minutes; 0 to disable) |
 | `static-age` | `86400` | Maximum Cache-Control age for static files in seconds (24 hours) |
 | `max-body-size` | `10` | Maximum request body size in MB (0 to disable) |
 
-Set `cache-size: 0` to disable caching entirely.
+Set `cache-size: 0` to disable caching entirely (server-wide).
+
+### Disabling Caching Per Vhost
+
+`cache-age` is a per-site setting, so a single virtual host can opt out of
+caching without affecting the rest of the server. Set `cache-age: 0` in that
+vhost's `_config.yaml` (e.g. `www/example.com/_config.yaml`):
+
+```yaml
+cache-age: 0
+```
+
+Pages for that vhost are then rendered fresh on every request — nothing is
+stored in or served from the render cache — and responses carry
+`Cache-Control: no-store` so browsers and proxies don't cache them either.
+Useful for sites whose pages must always reflect live data.
 
 Set `max-body-size: 0` to allow unlimited request bodies (not recommended).
 The request body is always piped to scripts on stdin, so the practical limit

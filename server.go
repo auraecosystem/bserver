@@ -1057,8 +1057,13 @@ func (m *virtualHostMux) handleYAML(w http.ResponseWriter, r *http.Request, docR
 	// scripts may produce different output based on $_GET/$_POST values.
 	dynamic := r.URL.RawQuery != "" || r.Method == http.MethodPost
 
+	// A vhost opts out of caching entirely with cache-age: 0 in its
+	// _config.yaml (site.cacheEnabled). Its pages are then re-rendered on
+	// every request and served with Cache-Control: no-store.
+	useCache := !debug && !dynamic && site.cacheEnabled() && m.cfg.Cache != nil
+
 	// Try cache (skip for debug mode and dynamic requests)
-	if !debug && !dynamic && m.cfg.Cache != nil {
+	if useCache {
 		if cached, ok := m.cfg.Cache.Get(key); ok {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
@@ -1077,7 +1082,7 @@ func (m *virtualHostMux) handleYAML(w http.ResponseWriter, r *http.Request, docR
 
 	// Re-check cache: a sibling request may have rendered this key while
 	// we were queued for a slot.
-	if !debug && !dynamic && m.cfg.Cache != nil {
+	if useCache {
 		if cached, ok := m.cfg.Cache.Get(key); ok {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
@@ -1106,7 +1111,7 @@ func (m *virtualHostMux) handleYAML(w http.ResponseWriter, r *http.Request, docR
 
 	// Don't cache pages that emit per-request HTTP headers (e.g., Set-Cookie
 	// for sessions) — each visitor needs their own headers.
-	if !debug && !dynamic && len(scriptHeaders) == 0 && m.cfg.Cache != nil {
+	if useCache && len(scriptHeaders) == 0 {
 		m.cfg.Cache.Put(key, output, sourceFiles)
 	}
 
@@ -1118,10 +1123,10 @@ func (m *virtualHostMux) handleYAML(w http.ResponseWriter, r *http.Request, docR
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if !debug && !dynamic && len(scriptHeaders) == 0 {
-		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
-	} else if len(scriptHeaders) > 0 {
+	if !site.cacheEnabled() || len(scriptHeaders) > 0 {
 		w.Header().Set("Cache-Control", "no-store")
+	} else if !debug && !dynamic {
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(output))
@@ -1134,8 +1139,13 @@ func (m *virtualHostMux) handleMarkdown(w http.ResponseWriter, r *http.Request, 
 	// Skip cache for requests with query parameters or POST data
 	dynamic := r.URL.RawQuery != "" || r.Method == http.MethodPost
 
+	// A vhost opts out of caching entirely with cache-age: 0 in its
+	// _config.yaml (site.cacheEnabled). Its pages are then re-rendered on
+	// every request and served with Cache-Control: no-store.
+	useCache := !debug && !dynamic && site.cacheEnabled() && m.cfg.Cache != nil
+
 	// Try cache (skip for debug mode and dynamic requests)
-	if !debug && !dynamic && m.cfg.Cache != nil {
+	if useCache {
 		if cached, ok := m.cfg.Cache.Get(key); ok {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
@@ -1154,7 +1164,7 @@ func (m *virtualHostMux) handleMarkdown(w http.ResponseWriter, r *http.Request, 
 
 	// Re-check cache: a sibling request may have rendered this key while
 	// we were queued for a slot.
-	if !debug && !dynamic && m.cfg.Cache != nil {
+	if useCache {
 		if cached, ok := m.cfg.Cache.Get(key); ok {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
@@ -1168,7 +1178,7 @@ func (m *virtualHostMux) handleMarkdown(w http.ResponseWriter, r *http.Request, 
 
 	// Don't cache pages that emit per-request HTTP headers (e.g., Set-Cookie
 	// for sessions) — each visitor needs their own headers.
-	if !debug && !dynamic && len(scriptHeaders) == 0 && m.cfg.Cache != nil {
+	if useCache && len(scriptHeaders) == 0 {
 		m.cfg.Cache.Put(key, output, sourceFiles)
 	}
 
@@ -1180,10 +1190,10 @@ func (m *virtualHostMux) handleMarkdown(w http.ResponseWriter, r *http.Request, 
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if !debug && !dynamic && len(scriptHeaders) == 0 {
-		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
-	} else if len(scriptHeaders) > 0 {
+	if !site.cacheEnabled() || len(scriptHeaders) > 0 {
 		w.Header().Set("Cache-Control", "no-store")
+	} else if !debug && !dynamic {
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(site.CacheAge.Seconds())))
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(output))
@@ -1252,8 +1262,9 @@ func (m *virtualHostMux) serveErrorPage(w http.ResponseWriter, r *http.Request, 
 	debug := m.cfg.debugEnabled(r)
 
 	// Cache rendered error pages per docRoot+statusCode+path (skip for debug
-	// mode or custom messages which are request-specific).
-	useCache := !debug && message == "" && m.cfg.Cache != nil
+	// mode, custom messages which are request-specific, and vhosts that
+	// disabled caching with cache-age: 0).
+	useCache := !debug && message == "" && site.cacheEnabled() && m.cfg.Cache != nil
 	key := fmt.Sprintf("%s:error:%s:%d:%s", docRoot, hostOnly(r.Host), statusCode, r.URL.Path)
 	if useCache {
 		if cached, ok := m.cfg.Cache.Get(key); ok {
