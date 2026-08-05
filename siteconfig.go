@@ -38,6 +38,7 @@ type siteSettings struct {
 	AuthSecret        []byte        // HMAC key that signs bs_auth cookies, loaded from AuthSecretFile
 	AuthSecretFile    string        // path the HMAC key is loaded from (created if absent)
 	AuthPublic        []string      // extra always-public path prefixes, beyond the built-in splash/asset set
+	AuthScope         string        // path prefix the auth gate covers ("" = whole vhost); set from a subdirectory _auth.yaml's location
 	AuthTTL           time.Duration // bs_auth cookie lifetime (default 7 days)
 	AuthUsers         []string      // additional approved addresses listed inline in _auth.yaml
 	AuthUsersFile     string        // file of additional approved addresses, one per line
@@ -323,6 +324,11 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 // the allow script starting to refuse it) revokes access on the next request
 // — within a minute for allow-script verdicts, which are briefly cached —
 // even if that person still holds an unexpired cookie.
+//
+// Location note: _auth.yaml normally lives in the vhost docroot and gates the
+// whole vhost. Placed instead in a direct subdirectory (e.g. log/_auth.yaml)
+// it gates only that subtree, leaving the rest of the vhost open — see
+// findAuthFile.
 func applyAuthFile(path string, s *siteSettings) {
 	m := loadConfigMap(path)
 	if m == nil {
@@ -602,7 +608,35 @@ func isAllowedType(ext string, types []string) bool {
 type vhostConfigEntry struct {
 	settings    siteSettings
 	modTime     time.Time // mtime of _config.yaml (zero if file absent)
-	authModTime time.Time // mtime of _auth.yaml (zero if file absent)
+	authPath    string    // _auth.yaml location the settings were built from
+	authModTime time.Time // mtime of that _auth.yaml (zero if file absent)
+}
+
+// findAuthFile locates the vhost's _auth.yaml: the docroot first (gates the
+// whole vhost, the original behaviour), then one directory level down in
+// sorted order, where the file's location scopes the gate to just that
+// subtree (e.g. log/_auth.yaml protects only /log/...).  Only the first
+// file found applies — one auth realm per vhost.  Directories whose names
+// begin with "." or "_" are not searched (their contents are never served).
+func findAuthFile(docRoot string) (path, scope string, mtime time.Time) {
+	path = filepath.Join(docRoot, "_auth.yaml")
+	if info, err := os.Stat(path); err == nil {
+		return path, "", info.ModTime()
+	}
+	entries, err := os.ReadDir(docRoot)
+	if err != nil {
+		return path, "", time.Time{}
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name()[0] == '.' || e.Name()[0] == '_' {
+			continue
+		}
+		p := filepath.Join(docRoot, e.Name(), "_auth.yaml")
+		if info, err := os.Stat(p); err == nil {
+			return p, "/" + e.Name(), info.ModTime()
+		}
+	}
+	return path, "", time.Time{}
 }
 
 var vhostConfigCache sync.Map // docRoot -> *vhostConfigEntry
@@ -618,21 +652,19 @@ func vhostConfigCacheSize() int {
 // mtime-based invalidation.
 func vhostSettings(docRoot string, defaults siteSettings) siteSettings {
 	configPath := filepath.Join(docRoot, "_config.yaml")
-	authPath := filepath.Join(docRoot, "_auth.yaml")
 
 	// Check file mtimes
-	var currentMtime, authMtime time.Time
+	var currentMtime time.Time
 	if info, err := os.Stat(configPath); err == nil {
 		currentMtime = info.ModTime()
 	}
-	if info, err := os.Stat(authPath); err == nil {
-		authMtime = info.ModTime()
-	}
+	authPath, authScope, authMtime := findAuthFile(docRoot)
 
 	// Return cached if mtimes match
 	if cached, ok := vhostConfigCache.Load(docRoot); ok {
 		entry := cached.(*vhostConfigEntry)
-		if entry.modTime.Equal(currentMtime) && entry.authModTime.Equal(authMtime) {
+		if entry.modTime.Equal(currentMtime) && entry.authPath == authPath &&
+			entry.authModTime.Equal(authMtime) {
 			return entry.settings
 		}
 	}
@@ -648,12 +680,14 @@ func vhostSettings(docRoot string, defaults siteSettings) siteSettings {
 	settings.SiteRoot = docRoot
 	if !authMtime.IsZero() {
 		applyAuthFile(authPath, &settings)
+		settings.AuthScope = authScope
 	}
 	finalizeAuthSettings(&settings)
 
 	vhostConfigCache.Store(docRoot, &vhostConfigEntry{
 		settings:    settings,
 		modTime:     currentMtime,
+		authPath:    authPath,
 		authModTime: authMtime,
 	})
 

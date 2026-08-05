@@ -279,6 +279,12 @@ every path outside the always-public set (the splash page `/`, `/favicon.ico`,
 `/robots.txt`, anything under `/.well-known/`, the `/auth/*` login endpoints,
 and any prefixes you add via `public:`) requires a valid session cookie.
 
+The gate can also cover just part of a site: place the `_auth.yaml` in a
+direct subdirectory instead of the docroot (e.g. `log/_auth.yaml`) and only
+that subtree requires sign-in — the rest of the vhost stays open. One
+`_auth.yaml` per vhost; a docroot file takes precedence over subdirectory
+ones.
+
 A visitor signs in by requesting a one-time 6-digit code, which is delivered to
 an approved address, and entering it. On success bserver sets `bs_auth` — an
 HMAC-signed cookie carrying the address and an expiry — so the session is

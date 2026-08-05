@@ -512,8 +512,8 @@ func TestCodeSendRateLimit(t *testing.T) {
 func TestMaskEmail(t *testing.T) {
 	cases := map[string]string{
 		"crystal@example.com": "c*****l@example.com",
-		"ab@x.com":        "a***@x.com",
-		"a@x.com":         "a***@x.com",
+		"ab@x.com":            "a***@x.com",
+		"a@x.com":             "a***@x.com",
 	}
 	for in, want := range cases {
 		if got := maskEmail(in); got != want {
@@ -580,5 +580,50 @@ func TestScriptEnvRemoteUser(t *testing.T) {
 		if strings.HasPrefix(e, "HTTP_REMOTE_USER=") && !strings.HasPrefix(e, "HTTP_REMOTE_USER=spoofed") {
 			t.Errorf("unexpected header mangling: %s", e)
 		}
+	}
+}
+
+// An _auth.yaml in a direct subdirectory gates only that subtree: the
+// settings pick it up with AuthScope set to the directory, authInScope
+// honours the scope, and a docroot file still takes precedence.
+func TestAuthFileInSubdirectory(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "secret")
+	if err := os.MkdirAll(filepath.Join(dir, "log"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authYAML := "email: owner@example.com\nsecret-file: " + secret + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "log", "_auth.yaml"), []byte(authYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := vhostSettings(dir, siteSettings{})
+	if s.AuthEmail != "owner@example.com" {
+		t.Fatalf("subdirectory _auth.yaml should enable the gate, got %q", s.AuthEmail)
+	}
+	if s.AuthScope != "/log" {
+		t.Fatalf("scope should be /log, got %q", s.AuthScope)
+	}
+	if !authInScope("/log", s) || !authInScope("/log/paypal-items.json", s) {
+		t.Error("paths under the subdirectory should be in scope")
+	}
+	if authInScope("/", s) || authInScope("/index.php", s) || authInScope("/logs", s) {
+		t.Error("paths outside the subdirectory must not be in scope")
+	}
+
+	// a docroot _auth.yaml wins and gates the whole vhost again
+	if err := os.WriteFile(filepath.Join(dir, "_auth.yaml"),
+		[]byte("email: root@example.com\nsecret-file: "+secret+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s = vhostSettings(dir, siteSettings{})
+	if s.AuthEmail != "root@example.com" {
+		t.Fatalf("docroot _auth.yaml should take precedence, got %q", s.AuthEmail)
+	}
+	if s.AuthScope != "" {
+		t.Fatalf("docroot file gates the whole vhost, got scope %q", s.AuthScope)
+	}
+	if !authInScope("/anything", s) {
+		t.Error("whole vhost should be in scope with a docroot _auth.yaml")
 	}
 }

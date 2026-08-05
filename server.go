@@ -317,6 +317,8 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Per-vhost passwordless auth: when auth-email is configured, everything
 	// outside the always-public set (splash, /auth/*, assets) requires a valid
 	// bs_auth cookie, obtained via a one-time code mailed to that address.
+	// An _auth.yaml living in a subdirectory instead of the docroot narrows
+	// the gate to that subtree (AuthScope); the rest of the vhost stays open.
 	// Checked before proxy handling so a gated backend (e.g. the /terminal/ web
 	// shell) is covered too. See auth.go.
 	if site.AuthEmail != "" {
@@ -326,7 +328,7 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		authUser, signedIn := validAuthCookie(r, site)
-		if !authPublic(p, site) && !signedIn {
+		if authInScope(p, site) && !authPublic(p, site) && !signedIn {
 			if r.Method == http.MethodGet || r.Method == http.MethodHead {
 				next := r.URL.Path
 				if r.URL.RawQuery != "" {

@@ -378,6 +378,16 @@ func clearAuthCookie(w http.ResponseWriter) {
 	})
 }
 
+// authInScope reports whether the auth gate covers path p. An _auth.yaml in
+// the vhost docroot gates everything (AuthScope empty); one living in a
+// subdirectory sets AuthScope to that directory and gates only its subtree.
+func authInScope(p string, s siteSettings) bool {
+	if s.AuthScope == "" {
+		return true
+	}
+	return p == s.AuthScope || strings.HasPrefix(p, s.AuthScope+"/")
+}
+
 // authPublic reports whether p is reachable without authentication: the splash
 // page, favicon/robots, ACME + security.txt under /.well-known, and any extra
 // prefixes the vhost lists in auth-public. Note that /auth/* is handled before
