@@ -2,13 +2,22 @@ package main
 
 // Passwordless per-vhost authentication.
 //
-// When a vhost sets auth-email in its _config.yaml, the whole vhost is gated:
-// the splash page and a small always-public set stay open, but every other
-// path requires a valid bs_auth cookie. A visitor gets the cookie by requesting
-// a one-time numeric code, which is emailed to auth-email, and entering it. The
-// cookie is an HMAC-signed token carrying the recipient address and an expiry
-// (default 7 days), so it can be verified statelessly on every request and
-// survives server restarts (the signing secret is persisted to a file).
+// Each _auth.yaml on a vhost (or the legacy auth-* keys in _config.yaml) is
+// an auth realm. A docroot file gates the whole vhost: the splash page and a
+// small always-public set stay open, but every other path requires a valid
+// bs_auth cookie. A file in a direct subdirectory gates just that subtree,
+// with its own owner, approved users, signing secret and cookie; several
+// subdirectories can each carry one. A visitor gets the cookie by requesting
+// a one-time numeric code, which is emailed to an approved address, and
+// entering it. The cookie is an HMAC-signed token carrying the recipient
+// address and an expiry (default 7 days), so it can be verified statelessly
+// on every request and survives server restarts (the signing secret is
+// persisted to a file).
+//
+// An _auth.yaml that exists but cannot be operated — unusable, nested deeper
+// than the realm search goes, or reached under a different spelling of its
+// path — fails closed: its subtree is refused outright rather than served
+// open (see authSubtreeDenied).
 //
 // The gate itself lives in server.go's ServeHTTP; this file provides the token
 // scheme, the code store, the mailer, and the /auth/* endpoints.
@@ -29,6 +38,7 @@ import (
 	"net/smtp"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -342,7 +352,7 @@ func parseAuthToken(secret []byte, token string, now time.Time) (string, bool) {
 func validAuthCookie(r *http.Request, s siteSettings) (string, bool) {
 	now := time.Now()
 	for _, c := range r.Cookies() {
-		if c.Name != authCookieName {
+		if c.Name != s.authCookie() {
 			continue
 		}
 		if email, ok := parseAuthToken(s.AuthSecret, c.Value, now); ok && authAllowed(s, email) {
@@ -355,7 +365,7 @@ func validAuthCookie(r *http.Request, s siteSettings) (string, bool) {
 func setAuthCookie(w http.ResponseWriter, s siteSettings, email string) {
 	expiry := time.Now().Add(s.AuthTTL)
 	http.SetCookie(w, &http.Cookie{
-		Name:     authCookieName,
+		Name:     s.authCookie(),
 		Value:    makeAuthToken(s.AuthSecret, normalizeEmail(email), expiry),
 		Path:     "/",
 		Expires:  expiry,
@@ -366,26 +376,128 @@ func setAuthCookie(w http.ResponseWriter, s siteSettings, email string) {
 	})
 }
 
-func clearAuthCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     authCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-	})
+// clearAuthCookie expires every auth session cookie the request carries —
+// the vhost-wide bs_auth and any per-subtree bs_auth-<dir> variants — so one
+// logout ends all of the visitor's sessions on the host.
+func clearAuthCookie(w http.ResponseWriter, r *http.Request) {
+	names := map[string]bool{authCookieName: true}
+	for _, c := range r.Cookies() {
+		if strings.HasPrefix(c.Name, authCookieName) {
+			names[c.Name] = true
+		}
+	}
+	for name := range names {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
 }
 
-// authInScope reports whether the auth gate covers path p. An _auth.yaml in
-// the vhost docroot gates everything (AuthScope empty); one living in a
-// subdirectory sets AuthScope to that directory and gates only its subtree.
-func authInScope(p string, s siteSettings) bool {
-	if s.AuthScope == "" {
-		return true
+// authRealmFor returns the realm whose scope covers path p, preferring the
+// most specific (longest) scope when a whole-vhost realm and a subtree realm
+// both match. nil means no realm covers p — the path is outside every gate.
+func authRealmFor(p string, s siteSettings) *authRealm {
+	var best *authRealm
+	for i := range s.AuthRealms {
+		realm := &s.AuthRealms[i]
+		if realm.scope != "" && p != realm.scope && !strings.HasPrefix(p, realm.scope+"/") {
+			continue
+		}
+		if best == nil || len(realm.scope) > len(best.scope) {
+			best = realm
+		}
 	}
-	return p == s.AuthScope || strings.HasPrefix(p, s.AuthScope+"/")
+	return best
+}
+
+// authLoginRealm picks the realm a /auth/* request signs in to, from the
+// next= parameter (query or form) that the login flow threads through every
+// step. A next outside every subtree falls back to the whole-vhost realm when
+// one exists, else the first operating realm; nil when no realm on the vhost
+// is usable. Choosing a realm grants nothing by itself — the code send and
+// verify steps still require an address that realm approves.
+func authLoginRealm(r *http.Request, s siteSettings) *siteSettings {
+	p := path.Clean(safeNext(r.FormValue("next")))
+	if realm := authRealmFor(p, s); realm != nil && !realm.broken {
+		return &realm.settings
+	}
+	for i := range s.AuthRealms {
+		if !s.AuthRealms[i].broken {
+			return &s.AuthRealms[i].settings
+		}
+	}
+	return nil
+}
+
+// authScopeCookieName derives the session-cookie name for a subtree realm
+// from its scope ("/log" -> "bs_auth-log"), so signing in to one realm never
+// overwrites another realm's session. Bytes that are unsafe in a cookie name
+// (including the leading slash) become '-'.
+func authScopeCookieName(scope string) string {
+	var b strings.Builder
+	b.WriteString(authCookieName)
+	for i := 0; i < len(scope); i++ {
+		c := scope[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9', c == '_':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
+}
+
+// authCookie returns the session-cookie name this realm issues and checks:
+// the default bs_auth for a whole-vhost realm (and for settings built
+// directly, e.g. in tests), bs_auth-<dir> for a subtree realm.
+func (s siteSettings) authCookie() string {
+	if s.AuthCookie != "" {
+		return s.AuthCookie
+	}
+	return authCookieName
+}
+
+// authSubtreeDenied reports whether serving upath must be refused because an
+// _auth.yaml exists on disk along its directory chain that no operating realm
+// governs. Realms are matched against the request *path*; this check walks
+// the *filesystem*, so the two agree exactly when serving is safe. Whatever
+// makes them disagree — an _auth.yaml nested deeper than one directory
+// level, a realm marked broken, a case-insensitive or Unicode-normalizing
+// filesystem resolving /LOG/x to log/x, a symlink the scope match missed —
+// lands here and fails closed instead of leaking the subtree. The deepest
+// _auth.yaml on the chain is the one that must have a matching realm,
+// mirroring authRealmFor's most-specific-scope-wins rule.
+//
+// TODO(perf): one Stat per path segment per request; see the note on
+// findAuthFiles about a short-TTL filesystem metadata cache covering both.
+func authSubtreeDenied(root, upath string, site siteSettings) bool {
+	deepest, rel := "", ""
+	for _, seg := range strings.Split(strings.TrimPrefix(upath, "/"), "/") {
+		if seg == "" {
+			break
+		}
+		rel += "/" + seg
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel), "_auth.yaml")); err == nil {
+			deepest = rel
+		}
+	}
+	if deepest == "" {
+		return false
+	}
+	for i := range site.AuthRealms {
+		realm := &site.AuthRealms[i]
+		if !realm.broken && realm.scope == deepest {
+			return false
+		}
+	}
+	return true
 }
 
 // authPublic reports whether p is reachable without authentication: the splash
@@ -681,7 +793,7 @@ func serveAuth(w http.ResponseWriter, r *http.Request, s siteSettings, p string)
 	case "/auth/verify":
 		authVerify(w, r, s)
 	case "/auth/logout":
-		clearAuthCookie(w)
+		clearAuthCookie(w, r)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	default:
 		http.NotFound(w, r)
