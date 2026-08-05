@@ -583,9 +583,9 @@ func TestScriptEnvRemoteUser(t *testing.T) {
 	}
 }
 
-// An _auth.yaml in a direct subdirectory gates only that subtree: the
-// settings pick it up with AuthScope set to the directory, authInScope
-// honours the scope, and a docroot file still takes precedence.
+// An _auth.yaml in a direct subdirectory becomes a realm gating only that
+// subtree, with its own cookie; a docroot file adds a whole-vhost realm and
+// the most specific scope governs each path.
 func TestAuthFileInSubdirectory(t *testing.T) {
 	dir := t.TempDir()
 	secret := filepath.Join(dir, "secret")
@@ -598,32 +598,151 @@ func TestAuthFileInSubdirectory(t *testing.T) {
 	}
 
 	s := vhostSettings(dir, siteSettings{})
-	if s.AuthEmail != "owner@example.com" {
-		t.Fatalf("subdirectory _auth.yaml should enable the gate, got %q", s.AuthEmail)
+	if len(s.AuthRealms) != 1 {
+		t.Fatalf("want one realm, got %d", len(s.AuthRealms))
 	}
-	if s.AuthScope != "/log" {
-		t.Fatalf("scope should be /log, got %q", s.AuthScope)
+	realm := authRealmFor("/log/entry.json", s)
+	if realm == nil || realm.broken {
+		t.Fatal("paths under the subdirectory should be governed by its realm")
 	}
-	if !authInScope("/log", s) || !authInScope("/log/paypal-items.json", s) {
-		t.Error("paths under the subdirectory should be in scope")
+	if realm.settings.AuthEmail != "owner@example.com" {
+		t.Fatalf("realm should carry the subdirectory's owner, got %q", realm.settings.AuthEmail)
 	}
-	if authInScope("/", s) || authInScope("/index.php", s) || authInScope("/logs", s) {
-		t.Error("paths outside the subdirectory must not be in scope")
+	if got := realm.settings.authCookie(); got != "bs_auth-log" {
+		t.Fatalf("subtree realm should issue its own cookie, got %q", got)
+	}
+	if authRealmFor("/log", s) == nil {
+		t.Error("the subdirectory itself should be in scope")
+	}
+	for _, p := range []string{"/", "/index.php", "/logs"} {
+		if authRealmFor(p, s) != nil {
+			t.Errorf("%s must not be governed by any realm", p)
+		}
 	}
 
-	// a docroot _auth.yaml wins and gates the whole vhost again
+	// A docroot _auth.yaml adds a whole-vhost realm; the subtree realm keeps
+	// governing its own directory because the most specific scope wins.
 	if err := os.WriteFile(filepath.Join(dir, "_auth.yaml"),
 		[]byte("email: root@example.com\nsecret-file: "+secret+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s = vhostSettings(dir, siteSettings{})
+	if len(s.AuthRealms) != 2 {
+		t.Fatalf("want two realms, got %d", len(s.AuthRealms))
+	}
 	if s.AuthEmail != "root@example.com" {
-		t.Fatalf("docroot _auth.yaml should take precedence, got %q", s.AuthEmail)
+		t.Fatalf("docroot _auth.yaml should gate the vhost, got %q", s.AuthEmail)
 	}
-	if s.AuthScope != "" {
-		t.Fatalf("docroot file gates the whole vhost, got scope %q", s.AuthScope)
+	if realm := authRealmFor("/anything", s); realm == nil || realm.settings.AuthEmail != "root@example.com" {
+		t.Error("paths outside the subtree belong to the docroot realm")
 	}
-	if !authInScope("/anything", s) {
-		t.Error("whole vhost should be in scope with a docroot _auth.yaml")
+	if realm := authRealmFor("/log/entry.json", s); realm == nil || realm.settings.AuthEmail != "owner@example.com" {
+		t.Error("the subtree realm must keep governing its directory")
+	}
+}
+
+// Two subdirectories each carrying an _auth.yaml operate as independent
+// realms: separate owners, separate signing secrets, separate cookies — a
+// session in one buys nothing in the other.
+func TestAuthMultipleSubdirRealms(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"admin", "reports"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		y := "email: " + sub + "@example.com\nsecret-file: " + filepath.Join(dir, sub+".secret") + "\n"
+		if err := os.WriteFile(filepath.Join(dir, sub, "_auth.yaml"), []byte(y), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := vhostSettings(dir, siteSettings{})
+	if len(s.AuthRealms) != 2 {
+		t.Fatalf("want two realms, got %d", len(s.AuthRealms))
+	}
+	admin := authRealmFor("/admin/x", s)
+	reports := authRealmFor("/reports/y", s)
+	if admin == nil || reports == nil || admin.broken || reports.broken {
+		t.Fatal("both subtrees must be governed by operating realms")
+	}
+	if admin.settings.AuthEmail != "admin@example.com" || reports.settings.AuthEmail != "reports@example.com" {
+		t.Error("each realm should carry its own owner")
+	}
+	if admin.settings.authCookie() == reports.settings.authCookie() {
+		t.Error("realms must issue distinct cookies")
+	}
+
+	// A valid admin-realm session presented to the reports realm is worthless:
+	// different cookie name, different secret, different approved set.
+	r := httptest.NewRequest("GET", "/reports/y", nil)
+	tok := makeAuthToken(admin.settings.AuthSecret, "admin@example.com", time.Now().Add(time.Hour))
+	r.AddCookie(&http.Cookie{Name: admin.settings.authCookie(), Value: tok})
+	if _, ok := validAuthCookie(r, reports.settings); ok {
+		t.Error("one realm's session must not unlock another realm")
+	}
+	if _, ok := validAuthCookie(r, admin.settings); !ok {
+		t.Error("the session must remain valid for its own realm")
+	}
+}
+
+// An _auth.yaml that cannot be operated — or one nested deeper than the gate
+// searches — must fail closed: its subtree is refused outright, never served
+// open.
+func TestAuthUnoperatedFileFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	// Broken: an owner but no secret-file, so the realm cannot sign cookies.
+	if err := os.MkdirAll(filepath.Join(dir, "private"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "private", "_auth.yaml"),
+		[]byte("email: owner@example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Nested too deep: realms are only built one directory level down.
+	if err := os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a", "b", "_auth.yaml"),
+		[]byte("email: deep@example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := vhostSettings(dir, siteSettings{})
+	realm := authRealmFor("/private/x", s)
+	if realm == nil || !realm.broken {
+		t.Error("an unusable _auth.yaml should yield a broken realm, not an open subtree")
+	}
+	if !authSubtreeDenied(dir, "/private/x", s) {
+		t.Error("the broken realm's subtree must be refused")
+	}
+	if !authSubtreeDenied(dir, "/a/b/x", s) || !authSubtreeDenied(dir, "/a/b", s) {
+		t.Error("a nested _auth.yaml's subtree must be refused")
+	}
+	for _, p := range []string{"/", "/a", "/a/x", "/open/file"} {
+		if authSubtreeDenied(dir, p, s) {
+			t.Errorf("%s should not be refused", p)
+		}
+	}
+}
+
+// A symlinked subdirectory behaves exactly like a real one: its _auth.yaml is
+// found and operated, so content served through the link is gated rather than
+// leaked (ReadDir alone would miss it — the entry is not a directory).
+func TestAuthSymlinkedSubdir(t *testing.T) {
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "_auth.yaml"),
+		[]byte("email: owner@example.com\nsecret-file: "+filepath.Join(target, "secret")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(dir, "vault")); err != nil {
+		t.Fatal(err)
+	}
+	s := vhostSettings(dir, siteSettings{})
+	realm := authRealmFor("/vault/x", s)
+	if realm == nil || realm.broken || realm.settings.AuthEmail != "owner@example.com" {
+		t.Fatal("a symlinked subdirectory's _auth.yaml must operate like a real one")
+	}
+	if authSubtreeDenied(dir, "/vault/x", s) {
+		t.Error("an operating symlinked realm serves gated content, it is not refused")
 	}
 }

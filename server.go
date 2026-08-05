@@ -314,38 +314,52 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-vhost passwordless auth: when auth-email is configured, everything
-	// outside the always-public set (splash, /auth/*, assets) requires a valid
-	// bs_auth cookie, obtained via a one-time code mailed to that address.
-	// An _auth.yaml living in a subdirectory instead of the docroot narrows
-	// the gate to that subtree (AuthScope); the rest of the vhost stays open.
-	// Checked before proxy handling so a gated backend (e.g. the /terminal/ web
-	// shell) is covered too. See auth.go.
-	if site.AuthEmail != "" {
+	// Per-vhost passwordless auth: every _auth.yaml on the vhost is an auth
+	// realm. One in the docroot (or the legacy auth-* keys in _config.yaml)
+	// gates the whole vhost; one in a direct subdirectory gates just that
+	// subtree, with its own owner, approved users and session cookie. The most
+	// specific realm governs a path. Everything a realm covers, outside its
+	// always-public set (splash, /auth/*, assets), requires that realm's valid
+	// session cookie, obtained via a one-time code mailed to an approved
+	// address. Checked before proxy handling so a gated backend (e.g. the
+	// /terminal/ web shell) is covered too. See auth.go.
+	if len(site.AuthRealms) > 0 {
 		p := path.Clean("/" + r.URL.Path)
 		if strings.HasPrefix(p, "/auth/") {
-			serveAuth(w, r, site, p)
-			return
-		}
-		authUser, signedIn := validAuthCookie(r, site)
-		if authInScope(p, site) && !authPublic(p, site) && !signedIn {
-			if r.Method == http.MethodGet || r.Method == http.MethodHead {
-				next := r.URL.Path
-				if r.URL.RawQuery != "" {
-					next += "?" + r.URL.RawQuery
-				}
-				http.Redirect(w, r, "/auth/login?next="+urlQueryEscape(next), http.StatusSeeOther)
+			if rs := authLoginRealm(r, site); rs != nil {
+				serveAuth(w, r, *rs, p)
 			} else {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				http.NotFound(w, r) // every realm broken; nothing to sign in to
 			}
 			return
 		}
-		// Carry the signed-in address down to the CGI layer, which exports it as
-		// REMOTE_USER so a PHP app can tell its users apart. Set only when a
-		// valid cookie was actually presented, so a public page never sees a
-		// stale or spoofed identity.
-		if signedIn {
-			r = r.WithContext(context.WithValue(r.Context(), authUserKey{}, authUser))
+		if realm := authRealmFor(p, site); realm != nil {
+			if realm.broken {
+				// A present-but-unusable _auth.yaml fails closed: refusing its
+				// subtree is recoverable, serving it open is not.
+				m.serveErrorPage(w, r, root, http.StatusNotFound, "", site, hostFallback)
+				return
+			}
+			authUser, signedIn := validAuthCookie(r, realm.settings)
+			if !authPublic(p, realm.settings) && !signedIn {
+				if r.Method == http.MethodGet || r.Method == http.MethodHead {
+					next := r.URL.Path
+					if r.URL.RawQuery != "" {
+						next += "?" + r.URL.RawQuery
+					}
+					http.Redirect(w, r, "/auth/login?next="+urlQueryEscape(next), http.StatusSeeOther)
+				} else {
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				}
+				return
+			}
+			// Carry the signed-in address down to the CGI layer, which exports
+			// it as REMOTE_USER so a PHP app can tell its users apart. Set only
+			// when a valid cookie was actually presented, so a public page never
+			// sees a stale or spoofed identity.
+			if signedIn {
+				r = r.WithContext(context.WithValue(r.Context(), authUserKey{}, authUser))
+			}
 		}
 	}
 
@@ -385,6 +399,18 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upath := path.Clean("/" + r.URL.Path)
+
+	// Fail closed on any _auth.yaml the gate above is not operating: one
+	// nested deeper than a direct subdirectory, one whose realm is broken, or
+	// a path reaching the same directory under a different spelling (a
+	// case-insensitive or Unicode-normalizing filesystem). Placed before all
+	// serving paths — path proxy, path-args scripts, static files, rendering
+	// — so nothing downstream can leak a subtree its _auth.yaml meant to gate.
+	if authSubtreeDenied(root, upath, site) {
+		log.Printf("auth: refusing %s%s: _auth.yaml present on this subtree but not operating", host, upath)
+		m.serveErrorPage(w, r, root, http.StatusNotFound, "", site, hostFallback)
+		return
+	}
 
 	// Path-based reverse proxy (e.g. a web terminal at /terminal/): serve a
 	// backend under this vhost's own path and cert, no separate proxy vhost.

@@ -279,11 +279,19 @@ every path outside the always-public set (the splash page `/`, `/favicon.ico`,
 `/robots.txt`, anything under `/.well-known/`, the `/auth/*` login endpoints,
 and any prefixes you add via `public:`) requires a valid session cookie.
 
-The gate can also cover just part of a site: place the `_auth.yaml` in a
+The gate can also cover just part of a site: place an `_auth.yaml` in a
 direct subdirectory instead of the docroot (e.g. `log/_auth.yaml`) and only
-that subtree requires sign-in — the rest of the vhost stays open. One
-`_auth.yaml` per vhost; a docroot file takes precedence over subdirectory
-ones.
+that subtree requires sign-in — the rest of the vhost stays open. Several
+subdirectories can each carry their own `_auth.yaml`; every file is an
+independent realm with its own owner, approved users, signing secret and
+session cookie, so signing in to one grants nothing in another. A docroot
+file and subdirectory files can coexist — the most specific one governs each
+path.
+
+An `_auth.yaml` that exists but cannot be operated fails closed: a file
+missing its `email:` or `secret-file:`, or one nested deeper than a direct
+subdirectory, causes every request into its subtree to be refused (with a
+log message saying why) rather than served open.
 
 A visitor signs in by requesting a one-time 6-digit code, which is delivered to
 an approved address, and entering it. On success bserver sets `bs_auth` — an

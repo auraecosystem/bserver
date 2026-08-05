@@ -38,7 +38,9 @@ type siteSettings struct {
 	AuthSecret        []byte        // HMAC key that signs bs_auth cookies, loaded from AuthSecretFile
 	AuthSecretFile    string        // path the HMAC key is loaded from (created if absent)
 	AuthPublic        []string      // extra always-public path prefixes, beyond the built-in splash/asset set
-	AuthScope         string        // path prefix the auth gate covers ("" = whole vhost); set from a subdirectory _auth.yaml's location
+	AuthScope         string        // path prefix this realm's gate covers ("" = whole vhost); set from a subdirectory _auth.yaml's location
+	AuthCookie        string        // session-cookie name this realm issues and checks ("" = the default bs_auth)
+	AuthRealms        []authRealm   // every auth gate operating on the vhost, one per _auth.yaml (plus the legacy _config.yaml auth-* keys)
 	AuthTTL           time.Duration // bs_auth cookie lifetime (default 7 days)
 	AuthUsers         []string      // additional approved addresses listed inline in _auth.yaml
 	AuthUsersFile     string        // file of additional approved addresses, one per line
@@ -327,8 +329,10 @@ func applySiteSettings(m map[string]interface{}, defaults siteSettings) siteSett
 //
 // Location note: _auth.yaml normally lives in the vhost docroot and gates the
 // whole vhost. Placed instead in a direct subdirectory (e.g. log/_auth.yaml)
-// it gates only that subtree, leaving the rest of the vhost open — see
-// findAuthFile.
+// it gates only that subtree, leaving the rest of the vhost open. Several
+// subdirectories can each carry their own _auth.yaml — every file becomes an
+// independent realm with its own owner, users and session cookie — see
+// findAuthFiles and authRealm.
 func applyAuthFile(path string, s *siteSettings) {
 	m := loadConfigMap(path)
 	if m == nil {
@@ -606,37 +610,84 @@ func isAllowedType(ext string, types []string) bool {
 // --- Per-vhost config caching ---
 
 type vhostConfigEntry struct {
-	settings    siteSettings
-	modTime     time.Time // mtime of _config.yaml (zero if file absent)
-	authPath    string    // _auth.yaml location the settings were built from
-	authModTime time.Time // mtime of that _auth.yaml (zero if file absent)
+	settings  siteSettings
+	modTime   time.Time // mtime of _config.yaml (zero if file absent)
+	authStamp string    // fingerprint of every _auth.yaml location + mtime (see authFilesStamp)
 }
 
-// findAuthFile locates the vhost's _auth.yaml: the docroot first (gates the
-// whole vhost, the original behaviour), then one directory level down in
-// sorted order, where the file's location scopes the gate to just that
-// subtree (e.g. log/_auth.yaml protects only /log/...).  Only the first
-// file found applies — one auth realm per vhost.  Directories whose names
-// begin with "." or "_" are not searched (their contents are never served).
-func findAuthFile(docRoot string) (path, scope string, mtime time.Time) {
-	path = filepath.Join(docRoot, "_auth.yaml")
-	if info, err := os.Stat(path); err == nil {
-		return path, "", info.ModTime()
+// authRealm is one auth gate operating on a vhost. Scope "" is the classic
+// whole-vhost gate (docroot _auth.yaml or _config.yaml auth-* keys); a direct
+// subdirectory's _auth.yaml yields a realm whose scope is that subtree, with
+// its own owner, approved users, signing secret and session cookie. The most
+// specific scope governs a given path (see authRealmFor).
+//
+// broken marks an _auth.yaml that was found but cannot be operated (no email,
+// no usable secret file): its whole scope is refused outright rather than
+// served open. A present-but-broken gate must fail closed — refusing the
+// subtree is recoverable, leaking it is not.
+type authRealm struct {
+	scope    string
+	broken   bool
+	settings siteSettings // full settings with this realm's auth config applied (zero when broken)
+}
+
+// authFileLoc is one _auth.yaml found on a vhost: where it lives, the path
+// prefix it governs ("" = whole vhost) and its mtime (for cache invalidation).
+type authFileLoc struct {
+	path    string
+	scope   string
+	modTime time.Time
+}
+
+// findAuthFiles locates every _auth.yaml a vhost operates: one in the docroot
+// (governs the whole vhost) plus one in each direct subdirectory (governs
+// just that subtree), in sorted order. Symlinked subdirectories are treated
+// exactly like real ones — content below them is served through the symlink,
+// so the gate must see them the same way (os.Stat follows links where
+// ReadDir's entry type does not). Directories whose names begin with "." or
+// "_" are not searched: their contents are never served. Files nested deeper
+// than one level are not operated as realms; authSubtreeDenied refuses their
+// subtrees instead of serving them open.
+//
+// TODO(perf): this is a ReadDir plus a Stat per subdirectory on every request
+// (vhostSettings runs per request). A short-TTL (~60s) cache of directory
+// listings and stat results on the input side of the filesystem would
+// collapse this — and authSubtreeDenied's per-segment stats — to nothing for
+// requests landing within the cache window.
+func findAuthFiles(docRoot string) []authFileLoc {
+	var found []authFileLoc
+	docFile := filepath.Join(docRoot, "_auth.yaml")
+	if info, err := os.Stat(docFile); err == nil {
+		found = append(found, authFileLoc{docFile, "", info.ModTime()})
 	}
 	entries, err := os.ReadDir(docRoot)
 	if err != nil {
-		return path, "", time.Time{}
+		return found
 	}
 	for _, e := range entries {
-		if !e.IsDir() || e.Name()[0] == '.' || e.Name()[0] == '_' {
+		name := e.Name()
+		if name[0] == '.' || name[0] == '_' {
 			continue
 		}
-		p := filepath.Join(docRoot, e.Name(), "_auth.yaml")
+		if st, err := os.Stat(filepath.Join(docRoot, name)); err != nil || !st.IsDir() {
+			continue
+		}
+		p := filepath.Join(docRoot, name, "_auth.yaml")
 		if info, err := os.Stat(p); err == nil {
-			return p, "/" + e.Name(), info.ModTime()
+			found = append(found, authFileLoc{p, "/" + name, info.ModTime()})
 		}
 	}
-	return path, "", time.Time{}
+	return found
+}
+
+// authFilesStamp fingerprints the set of _auth.yaml files so the settings
+// cache invalidates when any of them appears, moves, changes or disappears.
+func authFilesStamp(files []authFileLoc) string {
+	var b strings.Builder
+	for _, f := range files {
+		fmt.Fprintf(&b, "%s|%d;", f.path, f.modTime.UnixNano())
+	}
+	return b.String()
 }
 
 var vhostConfigCache sync.Map // docRoot -> *vhostConfigEntry
@@ -658,13 +709,13 @@ func vhostSettings(docRoot string, defaults siteSettings) siteSettings {
 	if info, err := os.Stat(configPath); err == nil {
 		currentMtime = info.ModTime()
 	}
-	authPath, authScope, authMtime := findAuthFile(docRoot)
+	authFiles := findAuthFiles(docRoot)
+	authStamp := authFilesStamp(authFiles)
 
 	// Return cached if mtimes match
 	if cached, ok := vhostConfigCache.Load(docRoot); ok {
 		entry := cached.(*vhostConfigEntry)
-		if entry.modTime.Equal(currentMtime) && entry.authPath == authPath &&
-			entry.authModTime.Equal(authMtime) {
+		if entry.modTime.Equal(currentMtime) && entry.authStamp == authStamp {
 			return entry.settings
 		}
 	}
@@ -678,17 +729,49 @@ func vhostSettings(docRoot string, defaults siteSettings) siteSettings {
 		settings = applySiteSettings(m, defaults)
 	}
 	settings.SiteRoot = docRoot
-	if !authMtime.IsZero() {
-		applyAuthFile(authPath, &settings)
-		settings.AuthScope = authScope
+
+	// preAuth is the config-only baseline each subtree realm builds on: a
+	// subdirectory's _auth.yaml states its own owner and secret rather than
+	// inheriting them from the docroot realm, so a subtree file that omits
+	// them yields a broken (refused) realm instead of one silently owned by
+	// the docroot's address.
+	preAuth := settings
+
+	var realms []authRealm
+	haveDocrootFile := len(authFiles) > 0 && authFiles[0].scope == ""
+	if haveDocrootFile {
+		applyAuthFile(authFiles[0].path, &settings)
 	}
 	finalizeAuthSettings(&settings)
+	if settings.AuthEmail != "" {
+		settings.AuthCookie = authCookieName
+		realms = append(realms, authRealm{scope: "", settings: settings})
+	} else if haveDocrootFile {
+		log.Printf("auth: %s cannot be operated — refusing all access to the vhost rather than serving it open", authFiles[0].path)
+		realms = append(realms, authRealm{scope: "", broken: true})
+	}
+	for _, f := range authFiles {
+		if f.scope == "" {
+			continue
+		}
+		rs := preAuth
+		rs.AuthScope = f.scope
+		applyAuthFile(f.path, &rs)
+		finalizeAuthSettings(&rs)
+		if rs.AuthEmail == "" {
+			log.Printf("auth: %s cannot be operated — refusing all access to %s rather than serving it open", f.path, f.scope)
+			realms = append(realms, authRealm{scope: f.scope, broken: true})
+			continue
+		}
+		rs.AuthCookie = authScopeCookieName(f.scope)
+		realms = append(realms, authRealm{scope: f.scope, settings: rs})
+	}
+	settings.AuthRealms = realms
 
 	vhostConfigCache.Store(docRoot, &vhostConfigEntry{
-		settings:    settings,
-		modTime:     currentMtime,
-		authPath:    authPath,
-		authModTime: authMtime,
+		settings:  settings,
+		modTime:   currentMtime,
+		authStamp: authStamp,
 	})
 
 	return settings
