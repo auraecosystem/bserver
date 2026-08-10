@@ -284,6 +284,10 @@ foreach ($_data as $record) {
 }
 ```
 
+The wrapper also populates the usual request superglobals — `$_GET`,
+`$_POST`, `$_COOKIE`, `$_REQUEST`, `$_SERVER`, and `$_FILES` — so embedded
+PHP behaves like a normal PHP page for forms and file uploads (see below).
+
 ### Shell Wrapper
 
 ```bash
@@ -329,7 +333,10 @@ echo "<p>$name: $value</p>"
 - **POST bodies**: the request body is piped on the script's **stdin**
   (Python/PHP/Shell) — it is not put into an environment variable, so it
   is not subject to OS env-block limits and cannot be command-injected.
-  For embedded JS, the body is not yet exposed in the embedded VM.
+  For embedded JS, the body is not yet exposed in the embedded VM. For
+  embedded PHP, the wrapper decodes the body into `$_POST` (for
+  `application/x-www-form-urlencoded`, `application/json`, and
+  `multipart/form-data`) and `$_FILES` (see [File Uploads](#file-uploads)).
 - **JS heap cap**: each JS invocation has a soft heap-growth cap
   (`js-heap-mb` in `_config.yaml`, default 128 MB) so a runaway script
   cannot exhaust the server's memory.
@@ -339,7 +346,7 @@ echo "<p>$name: $value</p>"
 In addition to inline PHP via the `^php` format, bserver serves any file
 ending in `.php` as a regular CGI request through the system `php-cgi`
 binary. This is what you want for traditional PHP apps and for any script
-that uses sessions, custom headers, or large file uploads.
+that uses sessions, custom headers, or `move_uploaded_file()`.
 
 ```
 www/example.com/contact.php
@@ -369,6 +376,50 @@ The inline `^php` format also supports `session_start()`, `header()`, and
 any headers PHP queues are extracted and added to the HTTP response.
 Session cookies are set automatically when `session_start()` is called.
 See `default/session.yaml` for a complete demo.
+
+## File Uploads
+
+A `multipart/form-data` POST to a YAML page with embedded PHP populates
+`$_FILES` just as a normal PHP page would. Point an upload form's `action`
+at the page and give the form `enctype="multipart/form-data"`:
+
+```html
+<form method="post" enctype="multipart/form-data" action="/upload">
+  <input type="file" name="photo">
+  <input type="submit" value="Upload">
+</form>
+```
+
+```yaml
+# upload.yaml
+main:
+  - php: |
+      if (!empty($_FILES['photo']['name']) && $_FILES['photo']['error'] === 0) {
+        $dest = __DIR__ . '/uploads/' . basename($_FILES['photo']['name']);
+        // Embedded PHP runs under the CLI SAPI, so use rename()/copy()
+        // here — not move_uploaded_file() (see note below).
+        if (rename($_FILES['photo']['tmp_name'], $dest)) {
+          echo '<p>Saved ' . htmlspecialchars($_FILES['photo']['name']) . '</p>';
+        }
+      }
+```
+
+`$_FILES` uses the standard structure — `name`, `type`, `tmp_name`,
+`error`, and `size` — and array field names like `photos[]` spread across
+each attribute (`$_FILES['photos']['name'][0]`, …) exactly as PHP does.
+Regular (non-file) form fields land in `$_POST` alongside. Each uploaded
+part is written to a temp file whose path is `tmp_name`; anything your code
+does not move away is deleted automatically when the request ends.
+
+> **Note:** embedded PHP runs through the PHP **CLI** interpreter, which
+> does not track HTTP uploads the way `php-cgi` does. `move_uploaded_file()`
+> and `is_uploaded_file()` will therefore reject the temp file — use
+> `rename()` or `copy()` instead. If you need `move_uploaded_file()`
+> specifically, serve the handler as a real [`.php` file](#php-files),
+> which runs under `php-cgi` and handles uploads the conventional way.
+>
+> Upload size is bounded by `max-body-size` (default 10 MB); see
+> [Server Features](/features).
 
 ## Next Steps
 
