@@ -411,6 +411,10 @@ Regular (non-file) form fields land in `$_POST` alongside. Each uploaded
 part is written to a temp file whose path is `tmp_name`; anything your code
 does not move away is deleted automatically when the request ends.
 
+The bundled [`/form`](/form) demo page has a live file-upload card
+(alongside its GET and POST form examples) that echoes `$_FILES` back to
+you — see `default/form.yaml` for the source.
+
 > **Note:** embedded PHP runs through the PHP **CLI** interpreter, which
 > does not track HTTP uploads the way `php-cgi` does. `move_uploaded_file()`
 > and `is_uploaded_file()` will therefore reject the temp file — use
