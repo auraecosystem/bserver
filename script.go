@@ -500,6 +500,57 @@ func shScriptWrapper(userCode string) string {
 	return sb.String()
 }
 
+// phpUploadHelperFuncs defines PHP helper functions that parse a
+// multipart/form-data request body into $_POST and $_FILES, mirroring the
+// superglobals php-cgi would populate. It is needed because embedded PHP runs
+// through `php -r` (the CLI SAPI), which — unlike php-cgi — does not process
+// rfc1867 file uploads; without this, POSTing a file to a YAML page left
+// $_POST and $_FILES empty.
+//
+// $_FILES follows the standard structure: a plain field name "photo" yields
+// $_FILES['photo'] = [name, type, tmp_name, error, size]; an array field name
+// such as "photos[]" or "docs[cv]" spreads its values across each attribute
+// (e.g. $_FILES['photos']['name'][0]) exactly as PHP does. Each uploaded part
+// is written to a temp file (name prefixed "php", matching PHP) whose path
+// becomes tmp_name; a shutdown function unlinks any that user code did not
+// move away, just as PHP cleans up un-moved uploads at request end.
+//
+// Caveat: move_uploaded_file() and is_uploaded_file() consult the CLI SAPI's
+// (empty) upload registry, so they reject these temp files. Embedded PHP
+// should instead rename()/copy() from tmp_name; a real .php file remains the
+// route for code that depends on move_uploaded_file().
+const phpUploadHelperFuncs = `
+function _bserver_parse_name($n) { $p = strpos($n, '['); if ($p === false) return array($n, array()); preg_match_all('/\[([^\]]*)\]/', substr($n, $p), $m); return array(substr($n, 0, $p), $m[1]); }
+function _bserver_assign(&$t, $keys, $v) { $ref = &$t; foreach ($keys as $k) { if ($k === '') { $ref[] = null; end($ref); $k = key($ref); } if (!isset($ref[$k]) || !is_array($ref[$k])) { $ref[$k] = array(); } $ref = &$ref[$k]; } $ref = $v; }
+function _bserver_parse_multipart($body, $boundary, &$post, &$files) {
+  $pairs = array();
+  foreach (explode('--' . $boundary, $body) as $block) {
+    if ($block === '' || substr($block, 0, 2) === '--') continue;
+    if (substr($block, 0, 2) === "\r\n") $block = substr($block, 2); elseif (substr($block, 0, 1) === "\n") $block = substr($block, 1);
+    if (substr($block, -2) === "\r\n") $block = substr($block, 0, -2); elseif (substr($block, -1) === "\n") $block = substr($block, 0, -1);
+    $sep = strpos($block, "\r\n\r\n"); $hl = 4; if ($sep === false) { $sep = strpos($block, "\n\n"); $hl = 2; } if ($sep === false) continue;
+    $rawh = substr($block, 0, $sep); $content = substr($block, $sep + $hl);
+    $name = null; $filename = null; $ctype = 'application/octet-stream';
+    foreach (preg_split('/\r\n|\n/', $rawh) as $hline) {
+      if (stripos($hline, 'content-disposition:') === 0) { if (preg_match('/name="([^"]*)"/i', $hline, $mm)) $name = $mm[1]; if (preg_match('/filename="([^"]*)"/i', $hline, $fm)) $filename = $fm[1]; }
+      elseif (stripos($hline, 'content-type:') === 0) { $ctype = trim(substr($hline, 13)); }
+    }
+    if ($name === null) continue;
+    list($base, $keys) = _bserver_parse_name($name);
+    if ($filename === null) { $pairs[] = urlencode($name) . '=' . urlencode($content); continue; }
+    if ($filename === '') { $info = array('name' => '', 'type' => '', 'tmp_name' => '', 'error' => 4, 'size' => 0); }
+    else {
+      $tmp = tempnam(sys_get_temp_dir(), 'php');
+      if ($tmp !== false && file_put_contents($tmp, $content) !== false) { $GLOBALS['_bserver_tmpfiles'][] = $tmp; $info = array('name' => $filename, 'type' => $ctype, 'tmp_name' => $tmp, 'error' => 0, 'size' => strlen($content)); }
+      else { if ($tmp !== false) @unlink($tmp); $info = array('name' => $filename, 'type' => $ctype, 'tmp_name' => '', 'error' => 7, 'size' => 0); }
+    }
+    if (empty($keys)) { $files[$base] = $info; }
+    else { if (!isset($files[$base]) || !is_array($files[$base])) $files[$base] = array(); foreach (array('name','type','tmp_name','error','size') as $attr) { if (!isset($files[$base][$attr]) || !is_array($files[$base][$attr])) $files[$base][$attr] = array(); _bserver_assign($files[$base][$attr], $keys, $info[$attr]); } }
+  }
+  if ($pairs) { parse_str(implode('&', $pairs), $post); }
+}
+`
+
 // phpScriptWrapper wraps user code in a PHP loop over JSON records.
 // The user code has $record (an associative array) available for each iteration.
 // PHP CLI mode doesn't auto-populate $_GET/$_POST/$_SERVER from CGI env vars,
@@ -522,8 +573,13 @@ func phpScriptWrapper(userCode string) string {
 	sb.WriteString("$_COOKIE = []; $_rawCookie = getenv('HTTP_COOKIE'); if ($_rawCookie !== false) { foreach (explode(';', $_rawCookie) as $_c) { $_c = trim($_c); if ($_c === '') continue; $_eq = strpos($_c, '='); if ($_eq !== false) { $_COOKIE[urldecode(substr($_c, 0, $_eq))] = urldecode(substr($_c, $_eq + 1)); } } }\n")
 	// Populate $_GET from QUERY_STRING
 	sb.WriteString("parse_str(getenv('QUERY_STRING') ?: '', $_GET);\n")
-	// Populate $_POST by reading the request body from stdin (piped by bserver).
-	sb.WriteString("$_POST = []; if (getenv('REQUEST_METHOD') === 'POST') { $_postData = stream_get_contents(STDIN); if ($_postData !== false && $_postData !== '') { $_ct = getenv('CONTENT_TYPE') ?: ''; if (stripos($_ct, 'application/x-www-form-urlencoded') !== false) { parse_str($_postData, $_POST); } elseif (stripos($_ct, 'application/json') !== false) { $_POST = json_decode($_postData, true) ?: []; } $GLOBALS['_RAW_POST_DATA'] = $_postData; } }\n")
+	// Helper functions + cleanup for multipart/form-data (file upload) parsing.
+	sb.WriteString(phpUploadHelperFuncs)
+	sb.WriteString("$GLOBALS['_bserver_tmpfiles'] = array(); register_shutdown_function(function() { foreach ($GLOBALS['_bserver_tmpfiles'] as $_f) { if (is_file($_f)) @unlink($_f); } });\n")
+	// Populate $_POST (and $_FILES for uploads) by reading the request body from
+	// stdin (piped by bserver). URL-encoded and JSON bodies fill $_POST directly;
+	// multipart/form-data is parsed into $_POST + $_FILES like php-cgi would.
+	sb.WriteString("$_POST = []; $_FILES = []; if (getenv('REQUEST_METHOD') === 'POST') { $_postData = stream_get_contents(STDIN); if ($_postData !== false && $_postData !== '') { $_ct = getenv('CONTENT_TYPE') ?: ''; if (stripos($_ct, 'multipart/form-data') !== false && preg_match('/boundary=\"?([^\";,]+)\"?/i', $_ct, $_bm)) { _bserver_parse_multipart($_postData, trim($_bm[1]), $_POST, $_FILES); } elseif (stripos($_ct, 'application/x-www-form-urlencoded') !== false) { parse_str($_postData, $_POST); $GLOBALS['_RAW_POST_DATA'] = $_postData; } elseif (stripos($_ct, 'application/json') !== false) { $_POST = json_decode($_postData, true) ?: []; $GLOBALS['_RAW_POST_DATA'] = $_postData; } else { $GLOBALS['_RAW_POST_DATA'] = $_postData; } } }\n")
 	// Populate $_REQUEST from merged GET+POST+COOKIE
 	sb.WriteString("$_REQUEST = array_merge($_COOKIE, $_GET, $_POST);\n")
 	// In CLI mode the default session.save_path (e.g. /var/lib/php/sessions)

@@ -35,10 +35,40 @@ main:
         - formcol:
           - formsubmit:
               SUBMIT
+  - card:
+    - h1: File Upload Test
+    - p: >
+        Uploads work on a plain YAML page — no separate .php file needed.
+        The embedded PHP below reads $_FILES just like a normal PHP page.
+    - form-upload-self:
+      - row:
+        - formcol:
+          - inputlabel:
+              name: upload
+              type: file
+              class: form-control
+              id: uploadid
+              label: Choose a file (e.g. a picture)
+      - row:
+        - formcol:
+          - formsubmit: UPLOAD
 
   - h3: 'PHP Script Output:'
   - php: |
       echo '<pre>';
+      if (!empty($_FILES)) {
+        foreach ($_FILES as $field => $f) {
+          if (is_array($f['name'])) {
+            echo "\$_FILES['$field']: " . count($f['name']) . " file(s)\n";
+          } else if ($f['error'] === UPLOAD_ERR_OK) {
+            echo "\$_FILES['$field']: {$f['name']} ({$f['type']}, {$f['size']} bytes)\n";
+          } else if ($f['error'] === UPLOAD_ERR_NO_FILE) {
+            echo "\$_FILES['$field']: no file selected\n";
+          } else {
+            echo "\$_FILES['$field']: upload error {$f['error']}\n";
+          }
+        }
+      }
       if (!empty($_POST)) {
         echo '$_POST=';
         var_dump($_POST);
@@ -47,7 +77,7 @@ main:
         echo '$_GET=';
         var_dump($_GET);
       }
-      else
+      else if (empty($_FILES))
         echo 'No GET or POST data';
       echo '</pre>';
 
@@ -64,3 +94,11 @@ main:
     class: m-2
     method: post
     action: /form
+
+^form-upload-self:
+  tag: form
+  params:
+    class: m-2
+    method: post
+    action: /form
+    enctype: multipart/form-data
