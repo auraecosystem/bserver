@@ -180,6 +180,13 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			r.Header.Del("Authorization")
 		}
+		// Proxied backends (ollama, imagen) stream responses that can run
+		// for many minutes; the server WriteTimeout is an absolute deadline
+		// that would cut them off mid-stream.  Clear it here and let the
+		// backend pace the connection - the reverse proxy still flushes
+		// each chunk, and idle connections are reaped by the transports.
+		rc := http.NewResponseController(w)
+		_ = rc.SetWriteDeadline(time.Time{})
 		entry.proxy.ServeHTTP(w, r)
 		return
 	}
@@ -1355,6 +1362,14 @@ type loggingResponseWriter struct {
 func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.statusCode = code
 	lrw.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer through
+// this wrapper (Flush, SetWriteDeadline).  Without it, streaming flushes
+// from the reverse-proxy and php paths are silently dropped and any
+// response longer than the server WriteTimeout dies mid-stream.
+func (lrw *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return lrw.ResponseWriter
 }
 
 // loggingMiddleware logs each request with client IP, hostname, method, path, status, and duration.
