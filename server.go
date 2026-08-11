@@ -266,6 +266,62 @@ func getPathProxy(backend string, allowPrivate bool) *httputil.ReverseProxy {
 	return rp
 }
 
+// proxyStreamIdle bounds how long a single write to a proxied client may
+// block before the connection is torn down. It is applied as a *rolling*
+// deadline (reset on every write by streamDeadlineWriter), so a proxied
+// response that streams for any total duration survives, while a client that
+// stops reading is cut off after this much idle time — reclaiming the
+// goroutine, connection, and kernel/socket buffers it was pinning. It stands
+// in for the server's absolute WriteTimeout, which cannot tell an
+// hours-long-but-healthy stream from a wedged one.
+const proxyStreamIdle = 120 * time.Second
+
+// streamDeadlineWriter wraps a ResponseWriter and pushes the connection's
+// write deadline forward on every write, converting the server's single
+// absolute WriteTimeout into a rolling idle timeout suitable for long-lived
+// proxied streams (ollama, imagen, SSE, ndjson). Refreshing the deadline
+// immediately before each write is what makes a slow backend safe: the gap
+// between chunks is not bounded (no write is in flight), only the duration of
+// an individual blocked write is. Unwrap exposes the underlying writer so
+// http.ResponseController (used by httputil.ReverseProxy to flush) and
+// http.Flusher reach the real connection through this wrapper.
+type streamDeadlineWriter struct {
+	http.ResponseWriter
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (sw *streamDeadlineWriter) Write(p []byte) (int, error) {
+	_ = sw.rc.SetWriteDeadline(time.Now().Add(sw.idle))
+	return sw.ResponseWriter.Write(p)
+}
+
+func (sw *streamDeadlineWriter) WriteHeader(code int) {
+	_ = sw.rc.SetWriteDeadline(time.Now().Add(sw.idle))
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *streamDeadlineWriter) Unwrap() http.ResponseWriter {
+	return sw.ResponseWriter
+}
+
+// streamProxy serves a reverse proxy through a rolling write deadline so a
+// stream that outlives the server's absolute WriteTimeout is not cut off,
+// without leaving stalled clients unbounded. Both proxy paths (vhost `http:`
+// and per-vhost `proxy-path:`) funnel through here so the streaming fix and
+// the resource bound stay in one place.
+func streamProxy(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy) {
+	rc := http.NewResponseController(w)
+	// Arm the deadline once up front and check the error a single time: if the
+	// writer chain can't carry a deadline (a wrapper missing Unwrap), streaming
+	// still works but is bounded by the absolute WriteTimeout — log it once so
+	// the regression is visible instead of silently degrading long streams.
+	if err := rc.SetWriteDeadline(time.Now().Add(proxyStreamIdle)); err != nil {
+		log.Printf("proxy stream for %s: write deadline unsupported (%v); long streams may be cut at WriteTimeout", r.Host, err)
+	}
+	proxy.ServeHTTP(&streamDeadlineWriter{ResponseWriter: w, rc: rc, idle: proxyStreamIdle}, r)
+}
+
 func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -387,13 +443,11 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				r.Header.Del("Authorization")
 			}
 			// Proxied backends (ollama, imagen) stream responses that can run
-			// for many minutes; the server WriteTimeout is an absolute deadline
-			// that would cut them off mid-stream.  Clear it here and let the
-			// backend pace the connection - the reverse proxy still flushes
-			// each chunk, and idle connections are reaped by the transports.
-			rc := http.NewResponseController(w)
-			_ = rc.SetWriteDeadline(time.Time{})
-			entry.proxy.ServeHTTP(w, r)
+			// for many minutes; the server's absolute WriteTimeout would cut
+			// them off mid-stream. Serve through a rolling write deadline so an
+			// active stream survives indefinitely while a client that stops
+			// reading is still reaped (see streamProxy).
+			streamProxy(w, r, entry.proxy)
 			return
 		}
 		// vhost intended as a proxy but setup was rejected — surface a
@@ -450,7 +504,10 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if rp := getPathProxy(site.ProxyBackend, site.ProxyAllowPrivate); rp != nil {
-			rp.ServeHTTP(w, r)
+			// Same rolling-deadline treatment as the vhost-level proxy above:
+			// a path-proxied stream (SSE/ndjson) must also outlive the server's
+			// absolute WriteTimeout without leaving stalled clients unbounded.
+			streamProxy(w, r, rp)
 		} else {
 			m.serveErrorPage(w, r, root, http.StatusBadGateway, "proxy backend misconfigured", site, hostFallback)
 		}
@@ -837,6 +894,9 @@ func (m *virtualHostMux) handlePHP(w http.ResponseWriter, r *http.Request, host,
 	// Go strips Host from r.Header and puts it in r.Host, so add it explicitly.
 	env = append(env, "HTTP_HOST="+r.Host)
 	for key, vals := range r.Header {
+		if !forwardableAsHTTPVar(key) {
+			continue
+		}
 		envKey := "HTTP_" + strings.ReplaceAll(strings.ToUpper(key), "-", "_")
 		env = append(env, envKey+"="+strings.Join(vals, ", "))
 	}
@@ -2186,8 +2246,9 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 
 // Unwrap exposes the wrapped ResponseWriter so http.ResponseController can
 // reach the connection through this middleware. Without it, SetWriteDeadline
-// in handlePHP silently returns ErrNotSupported and the server's 120s
-// WriteTimeout kills long-streaming PHP responses mid-body.
+// and Flush (used by handlePHP and the reverse-proxy stream path) silently
+// return ErrNotSupported and the server's 120s WriteTimeout kills
+// long-streaming responses mid-body.
 func (lrw *loggingResponseWriter) Unwrap() http.ResponseWriter {
 	return lrw.ResponseWriter
 }
@@ -2326,6 +2387,18 @@ func unsafeProxyTarget(target *url.URL) string {
 		}
 	}
 	return ""
+}
+
+// forwardableAsHTTPVar reports whether a request header may be exported to a
+// subprocess (php-cgi or an inline/data-source script) as an HTTP_<NAME> CGI
+// variable. The Proxy header is refused because HTTP_PROXY is honored as a
+// proxy selector by many HTTP clients (libcurl, Guzzle, Python requests, Go),
+// so forwarding a client-supplied `Proxy:` value would let any visitor route
+// the subprocess's outbound traffic through an attacker-controlled proxy —
+// the "httpoxy" class, CVE-2016-5385 et al. Proxy has no legitimate
+// request-header use, so dropping it costs nothing.
+func forwardableAsHTTPVar(key string) bool {
+	return !strings.EqualFold(key, "Proxy")
 }
 
 // sanitizeHeaderValue removes \r and \n from a header value to prevent
