@@ -150,7 +150,12 @@ func (ctx *renderContext) buildScriptEnv(scriptFile string) []string {
 	// Forward HTTP headers as HTTP_* variables. Strip CR/LF/NUL so a
 	// header value cannot expand into multiple env entries or inject
 	// shell statements when interpolated unquoted by a script.
+	// This env builder is also used by data-source scripts (datasource.go),
+	// so the Proxy-header drop below covers them too.
 	for key, vals := range r.Header {
+		if !forwardableAsHTTPVar(key) {
+			continue
+		}
 		envKey := "HTTP_" + strings.ReplaceAll(strings.ToUpper(key), "-", "_")
 		joined := strings.Join(vals, ", ")
 		env = append(env, envKey+"="+safeHeaderEnvValue(joined))

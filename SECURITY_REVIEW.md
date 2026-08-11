@@ -18,6 +18,8 @@
 | 8 | Path traversal + cache amplification via TLS SNI | **FIXED** — SNI validated; self-signed cache bounded |
 | 9 | SSRF via path-based proxy backend | **FIXED** — same guard as vhost proxy, `proxy-path-allow-private` opt-out |
 | 10 | Unescaped HTML attribute names | **FIXED** — attribute names validated before emission |
+| 11 | httpoxy: client `Proxy:` header exported as `HTTP_PROXY` to scripts | **FIXED** — `Proxy` header dropped in both env builders |
+| 12 | Proxied stream unbounded / cut at WriteTimeout | **FIXED** — rolling write deadline via `streamProxy` on both proxy paths |
 
 ---
 
@@ -112,6 +114,54 @@ YAML render pipeline. Security posture:
   values via `paramsWithVars` → `html.EscapeString`, text via content
   escaping). The redirect target remains sanitized by `safeNext` before it is
   seeded.
+
+---
+
+## Follow-up Review (2026-08-11): streaming timeout fix + hardening
+
+A review of the streaming-timeout change (proxied `ollama`/`imagen` responses
+were being reset at the 120s `WriteTimeout`) surfaced two defects fixed here.
+
+### 11. httpoxy — client `Proxy:` header reached scripts as `HTTP_PROXY`
+
+**Severity: HIGH** · **Files:** `server.go` (`handlePHP`), `script.go`
+(`buildScriptEnv`, also used by `datasource.go`)
+
+Both env builders forwarded every request header as an `HTTP_*` CGI variable
+with no blocklist, so a request carrying `Proxy: http://attacker/` set
+`HTTP_PROXY` in the subprocess environment. Many HTTP clients used from
+CGI/CLI context (libcurl, PHP Guzzle, Python requests, Go) honor `HTTP_PROXY`
+for their own outbound requests, so any visitor could silently route a script's
+outbound traffic through an attacker-controlled proxy — leaking secrets and
+allowing response tampering (CVE-2016-5385 et al.). Remotely triggerable by any
+visitor; the existing CR/LF sanitizer did not help.
+
+**Remediation (FIXED):** a shared `forwardableAsHTTPVar(key)` predicate refuses
+the `Proxy` header (case-insensitively; `Proxy` has no legitimate request-header
+use) and gates both forwarding loops. Regression tests
+`TestForwardableAsHTTPVar` and `TestScriptEnvDropsProxyHeader`.
+
+### 12. Proxied streams: cut at WriteTimeout, or unbounded once uncapped
+
+**Severity: MEDIUM** · **File:** `server.go` — both reverse-proxy paths
+
+The server's `WriteTimeout` is an *absolute* per-request deadline, so a proxied
+stream longer than 120s was reset mid-stream. The first fix cleared the deadline
+outright, which (a) covered only the vhost `http:` path, leaving the per-vhost
+`proxy-path` route still cut at 120s, and (b) removed the only bound on a client
+that stops reading while holding the connection open — pinning a goroutine,
+connection, and buffers indefinitely (a resource-exhaustion regression;
+`IdleTimeout` applies only between requests and TCP keepalive does not fire for a
+live-but-unreading peer).
+
+**Remediation (FIXED):** both proxy paths funnel through `streamProxy`, which
+serves the reverse proxy behind a `streamDeadlineWriter` that pushes the write
+deadline forward on every write — a *rolling* idle timeout. An actively
+streaming response of any total duration survives; a client that stalls a single
+write for `proxyStreamIdle` (120s) is torn down and its resources reclaimed. This
+mirrors the rolling-deadline pattern already used on the streaming-PHP path.
+Regression test `TestPathProxyStreamOutlivesWriteTimeout` (plus the existing
+`TestProxyStreamOutlivesWriteTimeout`).
 
 ---
 
