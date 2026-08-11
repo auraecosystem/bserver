@@ -386,6 +386,13 @@ func (m *virtualHostMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				r.Header.Del("Authorization")
 			}
+			// Proxied backends (ollama, imagen) stream responses that can run
+			// for many minutes; the server WriteTimeout is an absolute deadline
+			// that would cut them off mid-stream.  Clear it here and let the
+			// backend pace the connection - the reverse proxy still flushes
+			// each chunk, and idle connections are reaped by the transports.
+			rc := http.NewResponseController(w)
+			_ = rc.SetWriteDeadline(time.Time{})
 			entry.proxy.ServeHTTP(w, r)
 			return
 		}
