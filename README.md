@@ -7,7 +7,9 @@
 A small web server written in Go that builds HTML pages from **YAML and
 Markdown** definitions — no template language, no build step. Virtual
 hosting, automatic HTTPS, server-side scripts (Python, JavaScript, PHP,
-Shell), reverse proxying, and rate limiting are all built in.
+Shell), reverse proxying, and rate limiting are all built in.  Began
+as a small webserver with built-in letsencrypt for testing, and then
+was expanded to HTML generation from structured data files.
 
 **Website / live docs:** [bserver.info](https://bserver.info)
 
