@@ -31,11 +31,11 @@ itself a bserver site living in `www/default/`.
 ### Your First Page
 
 ```sh
-mkdir www/example.com
+mkdir www/example.net
 ```
 
 ```yaml
-# www/example.com/index.yaml
+# www/example.net/index.yaml
 main:
   - h1: "Hello World"
   - p: "Welcome to my site."
