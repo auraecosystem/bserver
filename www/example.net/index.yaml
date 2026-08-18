@@ -1,0 +1,17 @@
+main:
+  - h1: "Hello World"
+  - p: "Welcome to my site."
+  main:           # plain key — content
+  - h1: "Hi"
+
+^card:          # ^ — format definition (how a name renders as HTML)
+  tag: div
+  params: { class: card }
+
++headlink:      # + — merge into an existing definition
+  - { rel: stylesheet, href: /extra.css }
+
+$navlinks:      # $ — data source (script that produces the value)
+  script: javascript
+  code: |
+    print(JSON.stringify([{key: "/", value: "Home"}]));
