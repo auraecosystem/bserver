@@ -40,7 +40,7 @@ sudo ./install-service.sh
 Make a directory for your virtual host and drop an `index.yaml` into it:
 
 ```sh
-mkdir www/example.com
+mkdir www/stg.net
 ```
 
 ```yaml
