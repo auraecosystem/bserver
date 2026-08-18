@@ -1,0 +1,83 @@
+# 1. FORMAT DEFINITIONS (^) — Defines tags, default props, and HTML templates
+^layout:
+  tag: main
+  params:
+    theme: dark
+  template: |
+    <main class="app app-${theme}">
+      ${children}
+    </main>
+
+^card:
+  tag: article
+  params:
+    title: "Untitled"
+    badge: null
+  template: |
+    <article class="card">
+      <header>
+        <h3>${title}</h3>
+        ${badge ? `<span class="badge">${badge}</span>` : ''}
+      </header>
+      <div class="card-body">${children}</div>
+    </article>
+
+^button:
+  tag: button
+  params:
+    variant: primary
+    disabled: false
+  template: |
+    <button class="btn btn-${variant}" ${disabled ? 'disabled' : ''}>
+      ${children}
+    </button>
+
+
+# 2. DATA SOURCES ($) — Executes build-time scripts to supply dynamic props & state
+$siteNav:
+  script: javascript
+  code: |
+    print(JSON.stringify([
+      { href: "/", label: "Home" },
+      { href: "/docs", label: "Docs" }
+    ]));
+
+$userProfile:
+  script: javascript
+  code: |
+    print(JSON.stringify({
+      name: "kubu lee",
+      role: "Admin"
+    }));
+
+
+# 3. MERGES & EXTENSIONS (+) — Injects head elements & global prop defaults
++headlink:
+  - { rel: stylesheet, href: /styles/theme.css }
+  - { rel: icon, href: /favicon.ico }
+
++button:
+  params:
+    size: medium   # Injects default 'size' prop into ^button format
+
+
+# 4. PRIMARY CONTENT TREE (main:) — Assembles layout, overrides props, & binds data
+main:
+  - layout:
+      params:
+        theme: light
+      children:
+        - nav:
+            params:
+              links: $siteNav
+
+        - card:
+            params:
+              title: "User Profile"
+              badge: $userProfile.role
+            children:
+              - p: "Welcome back, user."
+              - button:
+                  params:
+                    variant: accent
+                  children: "Manage Account"
